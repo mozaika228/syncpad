@@ -1,0 +1,158 @@
+﻿:root {
+  --bg: #f4efe6;
+  --card: #fff9ef;
+  --ink: #1f1e1b;
+  --accent: #ba3f1d;
+  --accent-soft: #e8b89c;
+  --line: #d8c7b5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 10% 20%, #f9ddc8 0, transparent 30%),
+    radial-gradient(circle at 90% 0%, #f4c6ac 0, transparent 25%),
+    var(--bg);
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.meta {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.badge {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.2rem 0.7rem;
+  background: #fff;
+  font-size: 0.82rem;
+}
+
+.badge.online {
+  border-color: #2f8f4e;
+  color: #2f8f4e;
+}
+
+.badge.offline {
+  border-color: #a33a2d;
+  color: #a33a2d;
+}
+
+.badge.connecting {
+  border-color: #886529;
+  color: #886529;
+}
+
+.toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.toolbar button {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+  border-radius: 0.5rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.toolbar button:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: var(--card);
+  padding: 0.8rem;
+}
+
+.panel h2 {
+  margin-top: 0;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+textarea {
+  width: 100%;
+  min-height: 340px;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  padding: 0.8rem;
+  resize: vertical;
+  font-family: "IBM Plex Mono", "Consolas", monospace;
+  font-size: 0.96rem;
+  background: #fff;
+}
+
+.preview {
+  min-height: 340px;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  padding: 0.8rem;
+  background: #fff;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.seg-bold {
+  font-weight: 700;
+}
+
+.seg-italic {
+  font-style: italic;
+}
+
+.seg-underline {
+  text-decoration: underline;
+}
+
+.empty {
+  color: #6d655d;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
