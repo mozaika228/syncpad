@@ -15,6 +15,7 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
 - **Client UI:**
   - Collaborative block editor
   - Block type controls and inline formatting controls
+  - CRDT-native undo/redo (`Ctrl/Cmd+Z`, `Ctrl+Y` / `Cmd+Shift+Z`) implemented as inverse CRDT operations
   - Structured rich preview driven from CRDT state
 
 ## Project structure
@@ -60,5 +61,5 @@ node shared/test/rich-crdt.convergence.test.js
 
 - Relay history is in-memory only (no durable persistence)
 - No tombstone garbage collection / compaction yet
-- No CRDT-native undo/redo yet
+- Undo restore for deleted blocks currently recreates block shell (type) without restoring full deleted block text payload
 - Block split/merge UX is intentionally minimal in this iteration

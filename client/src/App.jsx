@@ -1,5 +1,6 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  GENESIS_BLOCK_ID,
   RichTextDocument,
   computeSingleSpanDiff,
   createSiteId,
@@ -21,6 +22,18 @@ function escapeHtml(value) {
 
 function toHtml(text) {
   return escapeHtml(text).replaceAll(" ", "&nbsp;");
+}
+
+function cloneId(id) {
+  return { lamport: id.lamport, site: id.site };
+}
+
+function cloneAttrs(attrs = {}) {
+  return {
+    bold: !!attrs.bold,
+    italic: !!attrs.italic,
+    underline: !!attrs.underline
+  };
 }
 
 function renderSegments(segments, keyPrefix) {
@@ -53,6 +66,8 @@ export default function App() {
   const socketRef = useRef(null);
   const lamportRef = useRef(0);
   const blockCacheRef = useRef(new Map());
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
 
   const blocks = docRef.current.getBlocks();
 
@@ -77,6 +92,148 @@ export default function App() {
     if (changed) setRev((v) => v + 1);
   }
 
+  function makeOpFromDescriptor(desc) {
+    const opId = { lamport: nextLamport(), site: siteId };
+
+    if (desc.type === "block_insert") {
+      return { type: "block_insert", opId, after: cloneId(desc.after), blockType: desc.blockType };
+    }
+    if (desc.type === "block_delete") {
+      return { type: "block_delete", opId, target: cloneId(desc.target) };
+    }
+    if (desc.type === "block_format") {
+      return { type: "block_format", opId, target: cloneId(desc.target), blockType: desc.blockType };
+    }
+    if (desc.type === "text_insert") {
+      return {
+        type: "text_insert",
+        opId,
+        block: cloneId(desc.block),
+        after: cloneId(desc.after),
+        value: desc.value,
+        attrs: cloneAttrs(desc.attrs)
+      };
+    }
+    if (desc.type === "text_delete") {
+      return { type: "text_delete", opId, block: cloneId(desc.block), target: cloneId(desc.target) };
+    }
+    if (desc.type === "text_format") {
+      return {
+        type: "text_format",
+        opId,
+        block: cloneId(desc.block),
+        target: cloneId(desc.target),
+        attrs: cloneAttrs(desc.attrs)
+      };
+    }
+
+    return null;
+  }
+
+  function buildInverseDescriptors(op) {
+    if (op.type === "block_insert") {
+      return [{ type: "block_delete", target: cloneId(op.opId) }];
+    }
+
+    if (op.type === "block_delete") {
+      const block = docRef.current.blocks.get(idKey(op.target));
+      if (!block || idKey(block.id) === idKey(GENESIS_BLOCK_ID)) return [];
+      return [
+        {
+          type: "block_insert",
+          after: cloneId(block.after),
+          blockType: block.type
+        }
+      ];
+    }
+
+    if (op.type === "block_format") {
+      const block = docRef.current.blocks.get(idKey(op.target));
+      if (!block) return [];
+      return [{ type: "block_format", target: cloneId(op.target), blockType: block.type }];
+    }
+
+    if (op.type === "text_insert") {
+      return [{ type: "text_delete", block: cloneId(op.block), target: cloneId(op.opId) }];
+    }
+
+    if (op.type === "text_delete") {
+      const inline = docRef.current.textByBlock.get(idKey(op.block));
+      const node = inline?.nodes.get(idKey(op.target));
+      if (!inline || !node) return [];
+      return [
+        {
+          type: "text_insert",
+          block: cloneId(op.block),
+          after: cloneId(node.after),
+          value: node.value,
+          attrs: cloneAttrs(node.attrs)
+        }
+      ];
+    }
+
+    if (op.type === "text_format") {
+      const inline = docRef.current.textByBlock.get(idKey(op.block));
+      const node = inline?.nodes.get(idKey(op.target));
+      if (!inline || !node) return [];
+      const prev = {};
+      for (const key of Object.keys(op.attrs || {})) {
+        prev[key] = !!node.attrs[key];
+      }
+      return [{ type: "text_format", block: cloneId(op.block), target: cloneId(op.target), attrs: prev }];
+    }
+
+    return [];
+  }
+
+  function executeLocalOps(ops, pushUndo = true, clearRedo = true) {
+    const inverseBatch = [];
+
+    for (const op of ops) {
+      const inverses = buildInverseDescriptors(op);
+      for (const inv of inverses) inverseBatch.unshift(inv);
+      applyAndRender(op);
+      emit(op);
+    }
+
+    if (pushUndo && inverseBatch.length > 0) {
+      undoStackRef.current.push(inverseBatch);
+      if (clearRedo) redoStackRef.current = [];
+    }
+  }
+
+  function executeDescriptorBatch(batch, pushUndo, clearRedo) {
+    if (!batch || batch.length === 0) return;
+    const ops = batch.map((desc) => makeOpFromDescriptor(desc)).filter(Boolean);
+    executeLocalOps(ops, pushUndo, clearRedo);
+  }
+
+  function runUndo() {
+    const batch = undoStackRef.current.pop();
+    if (!batch) return;
+
+    const redoBatch = [];
+    for (const desc of batch) {
+      const op = makeOpFromDescriptor(desc);
+      if (!op) continue;
+
+      const inverses = buildInverseDescriptors(op);
+      for (const inv of inverses) redoBatch.unshift(inv);
+      applyAndRender(op);
+      emit(op);
+    }
+
+    if (redoBatch.length > 0) {
+      redoStackRef.current.push(redoBatch);
+    }
+  }
+
+  function runRedo() {
+    const batch = redoStackRef.current.pop();
+    if (!batch) return;
+    executeDescriptorBatch(batch, true, false);
+  }
+
   function applyInlineFormat(attr) {
     if (!activeBlockKey || selection.start === selection.end) return;
 
@@ -84,12 +241,13 @@ export default function App() {
     if (!block) return;
 
     const nextValue = !marks[attr];
+    const ops = [];
     for (let i = selection.start; i < selection.end; i += 1) {
       const op = docRef.current.makeFormatTextOp(block.id, i, { [attr]: nextValue }, siteId, nextLamport());
       if (!op) continue;
-      applyAndRender(op);
-      emit(op);
+      ops.push(op);
     }
+    executeLocalOps(ops, true, true);
 
     setMarks((m) => ({ ...m, [attr]: nextValue }));
   }
@@ -97,21 +255,18 @@ export default function App() {
   function applyBlockType(blockId, blockType) {
     const op = docRef.current.makeFormatBlockOp(blockId, blockType, siteId, nextLamport());
     if (!op) return;
-    applyAndRender(op);
-    emit(op);
+    executeLocalOps([op], true, true);
   }
 
   function addBlockAfter(blockId) {
     const op = docRef.current.makeInsertBlockAfter(blockId, "paragraph", siteId, nextLamport());
-    applyAndRender(op);
-    emit(op);
+    executeLocalOps([op], true, true);
   }
 
   function deleteBlock(blockId) {
     const op = docRef.current.makeDeleteBlock(blockId, siteId, nextLamport());
     if (!op) return;
-    applyAndRender(op);
-    emit(op);
+    executeLocalOps([op], true, true);
   }
 
   function onBlockTextChanged(blockId, nextText) {
@@ -121,15 +276,17 @@ export default function App() {
     if (!delta) return;
 
     if (delta.removed.length > 0) {
+      const ops = [];
       for (let i = 0; i < delta.removed.length; i += 1) {
         const op = docRef.current.makeDeleteTextOp(blockId, delta.start, siteId, nextLamport());
         if (!op) continue;
-        applyAndRender(op);
-        emit(op);
+        ops.push(op);
       }
+      executeLocalOps(ops, true, true);
     }
 
     if (delta.inserted.length > 0) {
+      const ops = [];
       for (let i = 0; i < delta.inserted.length; i += 1) {
         const op = docRef.current.makeInsertTextOp(
           blockId,
@@ -140,9 +297,9 @@ export default function App() {
           marks
         );
         if (!op) continue;
-        applyAndRender(op);
-        emit(op);
+        ops.push(op);
       }
+      executeLocalOps(ops, true, true);
     }
 
     const current = docRef.current.getBlocks().find((b) => idKey(b.id) === key);
@@ -188,6 +345,25 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    function onKeyDown(event) {
+      const key = event.key.toLowerCase();
+      const mod = event.ctrlKey || event.metaKey;
+      if (!mod) return;
+
+      if (key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        runUndo();
+      } else if (key === "y" || (key === "z" && event.shiftKey)) {
+        event.preventDefault();
+        runRedo();
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
     const cache = new Map();
     for (const block of blocks) cache.set(idKey(block.id), block.text);
     blockCacheRef.current = cache;
@@ -222,6 +398,9 @@ export default function App() {
       </header>
 
       <div className="toolbar">
+        <button type="button" onClick={runUndo}>Undo</button>
+        <button type="button" onClick={runRedo}>Redo</button>
+        <div className="divider" />
         <button type="button" onClick={() => applyInlineFormat("bold")}>B</button>
         <button type="button" onClick={() => applyInlineFormat("italic")}>I</button>
         <button type="button" onClick={() => applyInlineFormat("underline")}>U</button>

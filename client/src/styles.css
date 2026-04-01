@@ -82,8 +82,9 @@ body {
   background: var(--card);
   color: var(--ink);
   border-radius: 0.5rem;
-  width: 2.2rem;
+  min-width: 2.2rem;
   height: 2.2rem;
+  padding: 0 0.65rem;
   font-weight: 800;
   cursor: pointer;
 }
@@ -91,6 +92,12 @@ body {
 .toolbar button:hover {
   border-color: var(--accent);
   transform: translateY(-1px);
+}
+
+.divider {
+  width: 1px;
+  background: var(--line);
+  margin: 0 0.1rem;
 }
 
 .layout {
