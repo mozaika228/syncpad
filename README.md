@@ -1,30 +1,27 @@
 ﻿# SyncPad
 
-SyncPad is a standalone real-time collaborative text editor MVP with a custom CRDT implementation (RGA style) and a dumb WebSocket relay.
+SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs/Automerge/ShareDB/Fluid).
 
 ## What is implemented
 
-- Custom text CRDT (no Yjs/Automerge/ShareDB/Fluid):
-  - per-character identifiers: `{ lamport, site }`
-  - deterministic merge for concurrent inserts
-  - tombstone deletes
-  - out-of-order operation handling via pending queues
-- Rich-text attributes as CRDT operations:
-  - `bold`, `italic`, `underline` stored and merged per character
-  - LWW merge by operation id ordering (Lamport + site)
-- Realtime synchronization:
-  - local-first apply for instant UX
-  - WebSocket operation broadcast through a minimal relay server
-  - in-memory op history replay for reconnect/new clients
-- React client UI:
-  - collaborative editor area
-  - rich-text preview panel generated from CRDT attributes
+- **Rich document CRDT (block + inline):**
+  - Block sequence CRDT: paragraph / heading / bullet blocks
+  - Per-block inline CRDT with per-character marks (`bold`, `italic`, `underline`)
+  - Deterministic concurrent merge by `(lamport, site)` ordering
+  - Tombstone deletes and out-of-order delivery recovery via pending queues
+- **Network layer:**
+  - Local-first apply for instant UX
+  - WebSocket relay server broadcasts operations and replays room history
+- **Client UI:**
+  - Collaborative block editor
+  - Block type controls and inline formatting controls
+  - Structured rich preview driven from CRDT state
 
 ## Project structure
 
 - `client/` - React + Vite UI
 - `server/` - Node.js WebSocket relay (`ws`)
-- `shared/` - CRDT core used by both client and server-side protocol payloads
+- `shared/` - CRDT core
 
 ## Run locally
 
@@ -38,16 +35,17 @@ Services:
 - client: `http://localhost:5173`
 - ws relay: `ws://localhost:8080`
 
-Open two browser tabs/windows and type simultaneously to observe convergence.
+## Formalization and convergence validation
 
-## CRDT formalization and convergence validation
+- Sequence CRDT spec: `docs/CRDT_SPEC.md`
+- Plain sequence convergence tests: `shared/test/crdt.convergence.test.js`
+- Rich block+inline convergence tests: `shared/test/rich-crdt.convergence.test.js`
 
-- Formal spec and proof sketch: `docs/CRDT_SPEC.md`
-- Deterministic canonical-state checks and fuzz tests: `shared/test/crdt.convergence.test.js`
-- Test command:
+Run checks directly:
 
 ```bash
-npm run test:crdt
+node shared/test/crdt.convergence.test.js
+node shared/test/rich-crdt.convergence.test.js
 ```
 
 ## Protocol (MVP)
@@ -58,17 +56,9 @@ npm run test:crdt
   - `{ kind: "op", roomId, op }`
   - `{ kind: "presence", roomId, users }`
 
-## Limitations / next steps
+## Current limits
 
-- No persistence yet (history in memory only)
-- No operational compression/GC for tombstones
-- No CRDT-native undo/redo stack yet
-- Text input diffing currently based on single-span change in textarea
-- Formatting acts on selected character range and is shown in preview panel
-
-## Why this converges
-
-- All operations are commutative/idempotent by unique op ids
-- Sibling insertion order is deterministic (`lamport`, then `site`)
-- Deletes/format changes for missing nodes are deferred and replayed when dependency appears
-- Every client applies the same set of operations with the same ordering rules
+- Relay history is in-memory only (no durable persistence)
+- No tombstone garbage collection / compaction yet
+- No CRDT-native undo/redo yet
+- Block split/merge UX is intentionally minimal in this iteration
