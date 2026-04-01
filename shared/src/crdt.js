@@ -1,10 +1,10 @@
-﻿const ROOT_ID = Object.freeze({ lamport: 0, site: "root" });
+﻿export const ROOT_ID = Object.freeze({ lamport: 0, site: "root" });
 
-function idKey(id) {
+export function idKey(id) {
   return `${id.lamport}:${id.site}`;
 }
 
-function compareId(a, b) {
+export function compareId(a, b) {
   if (a.lamport !== b.lamport) {
     return a.lamport - b.lamport;
   }
@@ -15,6 +15,19 @@ function compareId(a, b) {
 
 function cloneId(id) {
   return { lamport: id.lamport, site: id.site };
+}
+
+function cloneAttrs(attrs = {}) {
+  return {
+    bold: !!attrs.bold,
+    italic: !!attrs.italic,
+    underline: !!attrs.underline
+  };
+}
+
+function cloneClock(clock) {
+  if (!clock) return null;
+  return { lamport: clock.lamport, site: clock.site };
 }
 
 export class RgaDocument {
@@ -104,18 +117,12 @@ export class RgaDocument {
       return false;
     }
 
-    const attrs = {
-      bold: !!op.attrs?.bold,
-      italic: !!op.attrs?.italic,
-      underline: !!op.attrs?.underline
-    };
-
     this.nodes.set(opKey, {
       id: cloneId(op.opId),
       after: cloneId(op.after),
       value: op.value,
       deleted: false,
-      attrs,
+      attrs: cloneAttrs(op.attrs),
       attrClocks: {}
     });
 
@@ -229,11 +236,7 @@ export class RgaDocument {
       opId: { lamport, site },
       after: after || this.getTailId(),
       value,
-      attrs: {
-        bold: !!attrs.bold,
-        italic: !!attrs.italic,
-        underline: !!attrs.underline
-      }
+      attrs: cloneAttrs(attrs)
     };
   }
 
@@ -322,4 +325,35 @@ export function maxLamportFromOp(op) {
   if (op.after?.lamport) value = Math.max(value, op.after.lamport);
   if (op.target?.lamport) value = Math.max(value, op.target.lamport);
   return value;
+}
+
+export function getCanonicalState(doc) {
+  const nodes = [...doc.nodes.values()]
+    .filter((node) => !(node.id.lamport === ROOT_ID.lamport && node.id.site === ROOT_ID.site))
+    .map((node) => ({
+      id: cloneId(node.id),
+      after: cloneId(node.after),
+      value: node.value,
+      deleted: !!node.deleted,
+      attrs: cloneAttrs(node.attrs),
+      attrClocks: Object.fromEntries(
+        Object.entries(node.attrClocks || {})
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([name, clock]) => [name, cloneClock(clock)])
+      )
+    }))
+    .sort((a, b) => compareId(a.id, b.id));
+
+  const pending = {
+    inserts: [...doc.pendingInserts.values()].reduce((acc, items) => acc + items.length, 0),
+    deletes: [...doc.pendingDeletes.values()].reduce((acc, items) => acc + items.length, 0),
+    formats: [...doc.pendingFormats.values()].reduce((acc, items) => acc + items.length, 0)
+  };
+
+  return {
+    text: doc.getText(),
+    richSegments: doc.getRichSegments(),
+    nodes,
+    pending
+  };
 }

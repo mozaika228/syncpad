@@ -40,6 +40,16 @@ Services:
 
 Open two browser tabs/windows and type simultaneously to observe convergence.
 
+## CRDT formalization and convergence validation
+
+- Formal spec and proof sketch: `docs/CRDT_SPEC.md`
+- Deterministic canonical-state checks and fuzz tests: `shared/test/crdt.convergence.test.js`
+- Test command:
+
+```bash
+npm run test:crdt
+```
+
 ## Protocol (MVP)
 
 - client -> server: `{ kind: "op", room, op }`
