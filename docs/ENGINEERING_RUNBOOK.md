@@ -20,6 +20,13 @@ npm run test
 npm run ci
 ```
 
+- Optional validation:
+
+```bash
+npm run test:e2e:smoke
+npm run bench:relay
+```
+
 ## Operational endpoints
 
 - `GET /healthz` - liveness + room/client count.
@@ -30,13 +37,19 @@ npm run ci
 1. Set authentication and tenant controls:
    - `RELAY_AUTH_TOKEN` or `TENANT_TOKENS_JSON`
    - `ALLOWED_ORIGINS`
+   - Protocol version currently fixed to `v=1`
 2. Set resource limits:
    - `MAX_ROOM_CLIENTS`, `MAX_ROOMS_PER_TENANT`, `MAX_CLIENTS_PER_TENANT`
    - `MAX_HISTORY`, `MAX_BUFFERED_BYTES`, `MAX_MESSAGE_BYTES`
    - `MAX_OPS_PER_SECOND_PER_SOCKET`, `MAX_BYTES_PER_SECOND_PER_SOCKET`
 3. Set reliability controls:
    - `HEARTBEAT_INTERVAL_MS`, `ROOM_IDLE_TTL_MS`, `ROOM_GC_INTERVAL_MS`
+   - Optional Redis bus: `RELAY_REDIS_URL` (+ channel/seq prefixes)
 4. Verify `/healthz` and `/metrics` in staging before traffic.
+5. Verify room durability:
+   - create ops,
+   - restart relay,
+   - ensure reconnect clients can recover from persisted room history.
 
 ## Incident quick triage
 

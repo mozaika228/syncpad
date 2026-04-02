@@ -16,9 +16,12 @@
     "check": "node --check server/src/index.js && node --check shared/src/rich-crdt.js",
     "test:crdt": "npm run test -w shared",
     "test": "npm run test:crdt",
+    "test:e2e:smoke": "node scripts/e2e-smoke.mjs",
+    "bench:relay": "node scripts/load-relay.mjs",
     "ci": "npm run check && npm run test"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"
   }
 }
+

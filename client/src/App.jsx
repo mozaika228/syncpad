@@ -1,6 +1,7 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   GENESIS_BLOCK_ID,
+  INLINE_ROOT_ID,
   RichTextDocument,
   countTombstones,
   createCompactedSnapshot,
@@ -21,6 +22,7 @@ function readRuntimeConfig() {
 }
 
 const RUNTIME = readRuntimeConfig();
+const PROTOCOL_VERSION = 1;
 const WS_URL =
   (import.meta.env.VITE_WS_URL || "ws://localhost:8080") +
   `/?tenant=${encodeURIComponent(RUNTIME.tenantId)}&room=${encodeURIComponent(
@@ -260,7 +262,7 @@ export default function App() {
   function sendRaw(payload) {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(payload));
+    socket.send(JSON.stringify({ v: PROTOCOL_VERSION, ...payload }));
     return true;
   }
 
@@ -356,34 +358,72 @@ export default function App() {
     maybeCompactLocalState("server_seq_advance");
   }
 
-  function makeOpFromDescriptor(desc) {
-    const opId = { lamport: nextLamport(), site: siteId };
+  function makeOpsFromDescriptor(desc) {
+    const nextOpId = () => ({ lamport: nextLamport(), site: siteId });
 
-    if (desc.type === "block_insert") return { type: "block_insert", opId, after: cloneId(desc.after), blockType: desc.blockType };
-    if (desc.type === "block_delete") return { type: "block_delete", opId, target: cloneId(desc.target) };
-    if (desc.type === "block_format") return { type: "block_format", opId, target: cloneId(desc.target), blockType: desc.blockType };
+    if (desc.type === "block_insert") {
+      return [{ type: "block_insert", opId: nextOpId(), after: cloneId(desc.after), blockType: desc.blockType }];
+    }
+    if (desc.type === "block_delete") {
+      return [{ type: "block_delete", opId: nextOpId(), target: cloneId(desc.target) }];
+    }
+    if (desc.type === "block_format") {
+      return [{ type: "block_format", opId: nextOpId(), target: cloneId(desc.target), blockType: desc.blockType }];
+    }
     if (desc.type === "text_insert") {
-      return {
-        type: "text_insert",
-        opId,
-        block: cloneId(desc.block),
-        after: cloneId(desc.after),
-        value: desc.value,
-        attrs: cloneAttrs(desc.attrs)
-      };
+      return [
+        {
+          type: "text_insert",
+          opId: nextOpId(),
+          block: cloneId(desc.block),
+          after: cloneId(desc.after),
+          value: desc.value,
+          attrs: cloneAttrs(desc.attrs)
+        }
+      ];
     }
-    if (desc.type === "text_delete") return { type: "text_delete", opId, block: cloneId(desc.block), target: cloneId(desc.target) };
+    if (desc.type === "text_delete") {
+      return [{ type: "text_delete", opId: nextOpId(), block: cloneId(desc.block), target: cloneId(desc.target) }];
+    }
     if (desc.type === "text_format") {
-      return {
-        type: "text_format",
-        opId,
-        block: cloneId(desc.block),
-        target: cloneId(desc.target),
-        attrs: cloneAttrs(desc.attrs)
-      };
+      return [
+        {
+          type: "text_format",
+          opId: nextOpId(),
+          block: cloneId(desc.block),
+          target: cloneId(desc.target),
+          attrs: cloneAttrs(desc.attrs)
+        }
+      ];
+    }
+    if (desc.type === "block_restore") {
+      const blockInsertId = nextOpId();
+      const ops = [
+        {
+          type: "block_insert",
+          opId: blockInsertId,
+          after: cloneId(desc.after),
+          blockType: desc.blockType
+        }
+      ];
+
+      let prevId = cloneId(INLINE_ROOT_ID);
+      for (const node of desc.nodes || []) {
+        const textOpId = nextOpId();
+        ops.push({
+          type: "text_insert",
+          opId: textOpId,
+          block: cloneId(blockInsertId),
+          after: prevId,
+          value: String(node.value || " ").slice(0, 1),
+          attrs: cloneAttrs(node.attrs || {})
+        });
+        prevId = cloneId(textOpId);
+      }
+      return ops;
     }
 
-    return null;
+    return [];
   }
 
   function buildInverseDescriptors(op) {
@@ -392,7 +432,13 @@ export default function App() {
     if (op.type === "block_delete") {
       const block = docRef.current.blocks.get(idKey(op.target));
       if (!block || idKey(block.id) === idKey(GENESIS_BLOCK_ID)) return [];
-      return [{ type: "block_insert", after: cloneId(block.after), blockType: block.type }];
+      const inline = docRef.current.textByBlock.get(idKey(block.id));
+      const nodes = inline
+        ? inline
+            .visible()
+            .map((node) => ({ value: node.value, attrs: cloneAttrs(node.attrs) }))
+        : [];
+      return [{ type: "block_restore", after: cloneId(block.after), blockType: block.type, nodes }];
     }
 
     if (op.type === "block_format") {
@@ -445,7 +491,7 @@ export default function App() {
 
   function executeDescriptorBatch(batch, pushUndo, clearRedo) {
     if (!batch || batch.length === 0) return;
-    const ops = batch.map((desc) => makeOpFromDescriptor(desc)).filter(Boolean);
+    const ops = batch.flatMap((desc) => makeOpsFromDescriptor(desc));
     executeLocalOps(ops, pushUndo, clearRedo);
   }
 
@@ -455,15 +501,15 @@ export default function App() {
 
     const redoBatch = [];
     for (const desc of batch) {
-      const op = makeOpFromDescriptor(desc);
-      if (!op) continue;
+      const ops = makeOpsFromDescriptor(desc);
+      for (const op of ops) {
+        const inverses = buildInverseDescriptors(op);
+        for (const inv of inverses) redoBatch.unshift(inv);
 
-      const inverses = buildInverseDescriptors(op);
-      for (const inv of inverses) redoBatch.unshift(inv);
-
-      queueOutbox(op);
-      applyAndRender(op, true);
-      emit(op);
+        queueOutbox(op);
+        applyAndRender(op, true);
+        emit(op);
+      }
     }
 
     if (redoBatch.length > 0) redoStackRef.current.push(redoBatch);
@@ -619,6 +665,11 @@ export default function App() {
         try {
           payload = JSON.parse(event.data);
         } catch {
+          return;
+        }
+
+        if (payload.v != null && Number(payload.v) !== PROTOCOL_VERSION) {
+          setStatus("offline");
           return;
         }
 

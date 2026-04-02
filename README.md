@@ -14,6 +14,8 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
   - Offline-first outbox with durable local op-log (`localStorage`)
   - Reconnect sync via incremental history replay (`sinceSeq`) + idempotent dedupe
   - WebSocket relay assigns monotonic `seq`, sends `ack` and missing history
+  - Durable server room log (JSONL) with load-on-boot and compaction on trim
+  - Optional multi-node relay bus via Redis pub/sub + Redis INCR sequence allocator
   - Local tombstone GC + log compaction into compact snapshot when safe (outbox empty)
   - Scalable relay hardening: bounded history + `baseSeq`, room TTL eviction, heartbeat ping/pong, backpressure-aware send
   - Multi-tenant/security hardening: tenant isolation, hello-before-op policy, payload schema validation, per-socket rate limiting, optional token auth, origin allowlist
@@ -52,6 +54,7 @@ Client can pass tenant/session context via query params:
 ## Formalization and convergence validation
 
 - Sequence CRDT spec: `docs/CRDT_SPEC.md`
+- Protocol versioning/migration: `docs/PROTOCOL_VERSIONING.md`
 - Plain sequence convergence tests: `shared/test/crdt.convergence.test.js`
 - Rich block+inline convergence tests: `shared/test/rich-crdt.convergence.test.js`
 - Snapshot compaction checks: `shared/test/rich-crdt.snapshot.test.js`
@@ -74,23 +77,25 @@ Unified project commands:
 npm run check
 npm run test
 npm run ci
+npm run test:e2e:smoke
+npm run bench:relay
 ```
 
 ## Protocol (MVP)
 
 - client -> server:
-  - `{ kind: "hello", tenantId, roomId, userId, authToken, sinceSeq, siteId }`
-  - `{ kind: "op", tenantId, roomId, op }`
-  - `{ kind: "awareness", tenantId, roomId, awareness: { blockKey, start, end, focused } }`
+  - `{ v, kind: "hello", tenantId, roomId, userId, authToken, sinceSeq, siteId }`
+  - `{ v, kind: "op", tenantId, roomId, op }`
+  - `{ v, kind: "awareness", tenantId, roomId, awareness: { blockKey, start, end, focused } }`
 - server -> client:
-  - `{ kind: "history", tenantId, roomId, fromSeq, toSeq, baseSeq, truncated, events: [{ seq, op }] }`
-  - `{ kind: "op", tenantId, roomId, seq, op }`
-  - `{ kind: "ack", tenantId, roomId, seq, opId }`
-  - `{ kind: "presence", tenantId, roomId, users }`
-  - `{ kind: "awareness_snapshot", tenantId, roomId, users: [...] }`
-  - `{ kind: "awareness_update", tenantId, roomId, user }`
-  - `{ kind: "awareness_remove", tenantId, roomId, socketId, siteId, userId }`
-  - `{ kind: "error", code, reason }`
+  - `{ v, kind: "history", tenantId, roomId, fromSeq, toSeq, baseSeq, truncated, events: [{ seq, op }] }`
+  - `{ v, kind: "op", tenantId, roomId, seq, op }`
+  - `{ v, kind: "ack", tenantId, roomId, seq, opId }`
+  - `{ v, kind: "presence", tenantId, roomId, users }`
+  - `{ v, kind: "awareness_snapshot", tenantId, roomId, users: [...] }`
+  - `{ v, kind: "awareness_update", tenantId, roomId, user }`
+  - `{ v, kind: "awareness_remove", tenantId, roomId, socketId, siteId, userId }`
+  - `{ v, kind: "error", code, reason }`
 
 ## Security / Multi-tenant env
 
@@ -100,6 +105,7 @@ npm run ci
 - `MAX_OPS_PER_SECOND_PER_SOCKET=400`: per-socket op rate limiter.
 - `MAX_BYTES_PER_SECOND_PER_SOCKET=524288`: per-socket byte rate limiter.
 - `MAX_ROOMS_PER_TENANT=500`, `MAX_CLIENTS_PER_TENANT=2000`: tenant quotas.
+- `RELAY_REDIS_URL=redis://...`: enable multi-node bus and global room sequence allocator.
 - Complete env template: `.env.example`
 
 ## Performance tuning
@@ -113,9 +119,8 @@ npm run ci
 
 ## Current limits
 
-- Relay history is in-memory only (no server-side durable persistence yet)
+- Relay history is durable per node (JSONL), but not yet persisted in a shared distributed database
 - Awareness is ephemeral and in-memory only (no replay from durable store by design)
 - Server-side snapshot compaction is not implemented yet (current GC/compaction is client-local)
-- Undo restore for deleted blocks currently recreates block shell (type) without restoring full deleted block text payload
 - Block split/merge UX is intentionally minimal in this iteration
-- Multi-node broadcast bus (Redis/NATS/Kafka) is not wired yet; current scalability improvements are single-node relay hardening
+- Redis multi-node bus requires external Redis availability and network reliability tuning in production

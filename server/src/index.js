@@ -1,8 +1,13 @@
 ﻿import http from "node:http";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { WebSocketServer } from "ws";
+
+const PROTOCOL_VERSION = 1;
 
 const port = Number(process.env.PORT || 8080);
 const wsPath = process.env.WS_PATH || "/";
+const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "server", "data");
 
 const maxHistory = Number(process.env.MAX_HISTORY || 50000);
 const maxRoomClients = Number(process.env.MAX_ROOM_CLIENTS || 200);
@@ -16,6 +21,13 @@ const maxRoomsPerTenant = Number(process.env.MAX_ROOMS_PER_TENANT || 500);
 const maxClientsPerTenant = Number(process.env.MAX_CLIENTS_PER_TENANT || 2000);
 const maxOpsPerSecondPerSocket = Number(process.env.MAX_OPS_PER_SECOND_PER_SOCKET || 400);
 const maxBytesPerSecondPerSocket = Number(process.env.MAX_BYTES_PER_SECOND_PER_SOCKET || 512 * 1024);
+
+const redisUrl = process.env.RELAY_REDIS_URL || "";
+const redisChannelPrefix = process.env.RELAY_REDIS_CHANNEL_PREFIX || "syncpad:room";
+const redisSeqPrefix = process.env.RELAY_REDIS_SEQ_PREFIX || "syncpad:seq";
+const nodeId =
+  process.env.NODE_ID ||
+  `${process.pid}-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -50,7 +62,21 @@ const metrics = {
   historyRequests: 0,
   duplicateOps: 0,
   roomsEvicted: 0,
-  socketTerminatedHeartbeat: 0
+  socketTerminatedHeartbeat: 0,
+  redisBusPublished: 0,
+  redisBusReceived: 0,
+  durableAppends: 0,
+  durableCompactions: 0
+};
+
+const bus = {
+  enabled: false,
+  publisher: null,
+  subscriber: null,
+  connecting: null,
+  seqIncr: null,
+  publishRoomEvent: async () => {},
+  close: async () => {}
 };
 
 function idKey(id) {
@@ -78,6 +104,91 @@ function normalizeTenantRoom(tenantId, roomId) {
   return { tenant, room, key: `${tenant}::${room}` };
 }
 
+function roomFilePath(room) {
+  const safeTenant = room.tenantId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const safeRoom = room.roomId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return path.join(dataDir, "rooms", `${safeTenant}__${safeRoom}.jsonl`);
+}
+
+async function ensureDataDir() {
+  await fs.mkdir(path.join(dataDir, "rooms"), { recursive: true });
+}
+
+function enqueueWrite(room, task) {
+  room.writeQueue = room.writeQueue.then(task, task);
+  return room.writeQueue;
+}
+
+async function appendRoomEvent(room, entry) {
+  const line = `${JSON.stringify(entry)}\n`;
+  const filePath = roomFilePath(room);
+  await enqueueWrite(room, async () => {
+    await fs.appendFile(filePath, line, "utf8");
+    metrics.durableAppends += 1;
+  });
+}
+
+async function compactRoomFile(room) {
+  const filePath = roomFilePath(room);
+  const lines = room.history.map((entry) => JSON.stringify(entry)).join("\n");
+  const content = lines.length > 0 ? `${lines}\n` : "";
+  await enqueueWrite(room, async () => {
+    await fs.writeFile(filePath, content, "utf8");
+    metrics.durableCompactions += 1;
+  });
+}
+
+async function loadRoomFromDisk(room) {
+  const filePath = roomFilePath(room);
+  let text;
+
+  try {
+    text = await fs.readFile(filePath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return;
+    throw err;
+  }
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let maxSeq = 0;
+  let minSeq = Number.MAX_SAFE_INTEGER;
+
+  for (const line of lines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!entry || !Number.isInteger(entry.seq) || entry.seq <= 0 || !entry.op?.opId) continue;
+
+    room.history.push(entry);
+    room.seenOps.set(idKey(entry.op.opId), entry.seq);
+    maxSeq = Math.max(maxSeq, entry.seq);
+    minSeq = Math.min(minSeq, entry.seq);
+  }
+
+  if (room.history.length > maxHistory) {
+    const overflow = room.history.length - maxHistory;
+    const removed = room.history.splice(0, overflow);
+    for (const old of removed) {
+      room.seenOps.delete(idKey(old.op.opId));
+    }
+  }
+
+  if (maxSeq > 0) {
+    room.baseSeq = room.history.length > 0 ? room.history[0].seq : maxSeq + 1;
+    room.nextSeq = maxSeq + 1;
+  } else if (minSeq !== Number.MAX_SAFE_INTEGER) {
+    room.baseSeq = minSeq;
+    room.nextSeq = minSeq;
+  }
+}
+
 function getTenantCounter(tenant) {
   if (!tenantStats.has(tenant)) {
     tenantStats.set(tenant, { rooms: 0, clients: 0 });
@@ -103,7 +214,7 @@ function decTenantClient(tenant) {
   counter.clients = Math.max(0, counter.clients - 1);
 }
 
-function getOrCreateRoom(tenantId, roomId) {
+async function getOrCreateRoom(tenantId, roomId) {
   const normalized = normalizeTenantRoom(tenantId, roomId);
   if (!normalized) return null;
 
@@ -114,9 +225,7 @@ function getOrCreateRoom(tenantId, roomId) {
   }
 
   const tenantCounter = getTenantCounter(normalized.tenant);
-  if (tenantCounter.rooms >= maxRoomsPerTenant) {
-    return null;
-  }
+  if (tenantCounter.rooms >= maxRoomsPerTenant) return null;
 
   const room = {
     key: normalized.key,
@@ -129,8 +238,12 @@ function getOrCreateRoom(tenantId, roomId) {
     seenOps: new Map(),
     awareness: new Map(),
     createdAt: now(),
-    lastActiveAt: now()
+    lastActiveAt: now(),
+    writeQueue: Promise.resolve()
   };
+
+  await loadRoomFromDisk(room);
+
   rooms.set(normalized.key, room);
   incTenantRoom(normalized.tenant);
   return room;
@@ -197,6 +310,11 @@ function validateAwareness(awareness) {
   return true;
 }
 
+function validateProtocolVersion(value) {
+  if (value == null) return true;
+  return Number(value) === PROTOCOL_VERSION;
+}
+
 function authAllowed(tenantId, token) {
   if (tenantTokens && typeof tenantTokens === "object" && tenantTokens[tenantId]) {
     return token === String(tenantTokens[tenantId]);
@@ -237,7 +355,7 @@ function safeSendSerialized(socket, serialized) {
 
 function rejectSocket(socket, code, reason) {
   try {
-    safeSend(socket, { kind: "error", code, reason });
+    safeSend(socket, { v: PROTOCOL_VERSION, kind: "error", code, reason });
   } finally {
     socket.close(1008, reason);
   }
@@ -265,7 +383,7 @@ function rateAllowed(socket, bytes) {
 }
 
 function broadcast(room, payload) {
-  const serialized = JSON.stringify(payload);
+  const serialized = JSON.stringify({ v: PROTOCOL_VERSION, ...payload });
   for (const socket of room.clients) {
     const sent = safeSendSerialized(socket, serialized);
     if (sent) metrics.messagesBroadcast += 1;
@@ -293,6 +411,7 @@ function broadcastAwareness(room, payload) {
 
 function sendAwarenessSnapshot(socket, room) {
   safeSend(socket, {
+    v: PROTOCOL_VERSION,
     kind: "awareness_snapshot",
     tenantId: room.tenantId,
     roomId: room.roomId,
@@ -309,7 +428,7 @@ function historySliceFromSeq(room, sinceSeq) {
   return { events: room.history.slice(start), truncated: false };
 }
 
-function trimHistory(room) {
+async function trimHistory(room) {
   if (room.history.length <= maxHistory) return;
 
   const overflow = room.history.length - maxHistory;
@@ -319,16 +438,20 @@ function trimHistory(room) {
   for (const entry of removed) {
     room.seenOps.delete(idKey(entry.op.opId));
   }
+
+  await compactRoomFile(room);
 }
 
 function validateHelloPayload(payload) {
   if (!payload || typeof payload !== "object") return false;
   if (payload.kind !== "hello") return false;
+  if (!validateProtocolVersion(payload.v)) return false;
   if (payload.sinceSeq != null && !Number.isFinite(Number(payload.sinceSeq))) return false;
   if (payload.tenantId != null && sanitizeTenant(payload.tenantId) === null) return false;
   if (payload.roomId != null && sanitizeRoom(payload.roomId) === null) return false;
   if (payload.userId != null && String(payload.userId).length > 128) return false;
   if (payload.authToken != null && String(payload.authToken).length > 512) return false;
+  if (payload.siteId != null && String(payload.siteId).length > 128) return false;
   return true;
 }
 
@@ -369,6 +492,7 @@ function handleHello(socket, room, payload) {
 
   const { events, truncated } = historySliceFromSeq(room, sinceSeq);
   safeSend(socket, {
+    v: PROTOCOL_VERSION,
     kind: "history",
     tenantId: room.tenantId,
     roomId: room.roomId,
@@ -385,10 +509,40 @@ function handleHello(socket, room, payload) {
 function validateOpPayload(payload) {
   if (!payload || typeof payload !== "object") return false;
   if (payload.kind !== "op") return false;
+  if (!validateProtocolVersion(payload.v)) return false;
   return validateOp(payload.op);
 }
 
-function handleOp(socket, room, payload) {
+async function allocateSeq(room) {
+  if (bus.seqIncr) {
+    const n = await bus.seqIncr(room.key);
+    return n;
+  }
+
+  const seq = room.nextSeq;
+  room.nextSeq += 1;
+  return seq;
+}
+
+async function applyAcceptedOp(room, seq, op, sourceNode = nodeId) {
+  room.lastActiveAt = now();
+  room.nextSeq = Math.max(room.nextSeq, seq + 1);
+
+  const entry = { seq, op };
+  room.history.push(entry);
+  room.seenOps.set(idKey(op.opId), seq);
+
+  await appendRoomEvent(room, entry);
+  await trimHistory(room);
+
+  broadcast(room, { kind: "op", tenantId: room.tenantId, roomId: room.roomId, seq, op });
+
+  if (sourceNode === nodeId) {
+    await bus.publishRoomEvent(room, { kind: "op", tenantId: room.tenantId, roomId: room.roomId, seq, op });
+  }
+}
+
+async function handleOp(socket, room, payload) {
   if (!socket.session?.ready) {
     rejectSocket(socket, "hello_required", "hello handshake required before ops");
     return;
@@ -407,6 +561,7 @@ function handleOp(socket, room, payload) {
     metrics.duplicateOps += 1;
     const seq = room.seenOps.get(opKey);
     safeSend(socket, {
+      v: PROTOCOL_VERSION,
       kind: "ack",
       tenantId: room.tenantId,
       roomId: room.roomId,
@@ -417,17 +572,17 @@ function handleOp(socket, room, payload) {
     return;
   }
 
-  const seq = room.nextSeq;
-  room.nextSeq += 1;
-  room.lastActiveAt = now();
+  const seq = await allocateSeq(room);
+  await applyAcceptedOp(room, seq, op, nodeId);
 
-  const entry = { seq, op };
-  room.history.push(entry);
-  room.seenOps.set(opKey, seq);
-  trimHistory(room);
-
-  broadcast(room, { kind: "op", tenantId: room.tenantId, roomId: room.roomId, seq, op });
-  safeSend(socket, { kind: "ack", tenantId: room.tenantId, roomId: room.roomId, seq, opId: op.opId });
+  safeSend(socket, {
+    v: PROTOCOL_VERSION,
+    kind: "ack",
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    seq,
+    opId: op.opId
+  });
 }
 
 function handleAwareness(socket, room, payload) {
@@ -436,7 +591,7 @@ function handleAwareness(socket, room, payload) {
     return;
   }
 
-  if (!validateAwareness(payload?.awareness)) {
+  if (!validateProtocolVersion(payload?.v) || !validateAwareness(payload?.awareness)) {
     metrics.schemaRejected += 1;
     rejectSocket(socket, "bad_awareness", "awareness payload validation failed");
     return;
@@ -523,13 +678,18 @@ function setupSocket(room, socket, bootstrap) {
       return;
     }
 
+    if (!validateProtocolVersion(payload?.v)) {
+      rejectSocket(socket, "protocol_version_mismatch", `expected v=${PROTOCOL_VERSION}`);
+      return;
+    }
+
     if (payload?.kind === "hello") {
       handleHello(socket, room, payload);
       return;
     }
 
     if (payload?.kind === "op") {
-      handleOp(socket, room, payload);
+      void handleOp(socket, room, payload);
       return;
     }
 
@@ -551,6 +711,105 @@ function setupSocket(room, socket, bootstrap) {
   });
 }
 
+async function initRedisBus() {
+  if (!redisUrl) return;
+
+  if (bus.connecting) {
+    await bus.connecting;
+    return;
+  }
+
+  bus.connecting = (async () => {
+    let redis;
+    try {
+      redis = await import("redis");
+    } catch {
+      console.warn("[relay] redis package not installed; RELAY_REDIS_URL ignored");
+      return;
+    }
+
+    const publisher = redis.createClient({ url: redisUrl });
+    const subscriber = redis.createClient({ url: redisUrl });
+
+    publisher.on("error", (err) => console.error("[relay] redis publisher error", err));
+    subscriber.on("error", (err) => console.error("[relay] redis subscriber error", err));
+
+    await publisher.connect();
+    await subscriber.connect();
+
+    await subscriber.pSubscribe(`${redisChannelPrefix}:*`, async (message, channel) => {
+      let envelope;
+      try {
+        envelope = JSON.parse(message);
+      } catch {
+        return;
+      }
+
+      if (!envelope || envelope.nodeId === nodeId || !envelope.tenantId || !envelope.roomId) return;
+      if (!validateProtocolVersion(envelope.v)) return;
+
+      metrics.redisBusReceived += 1;
+
+      const room = await getOrCreateRoom(envelope.tenantId, envelope.roomId);
+      if (!room) return;
+
+      if (envelope.kind === "op" && envelope.op && Number.isInteger(envelope.seq)) {
+        const key = idKey(envelope.op.opId);
+        if (room.seenOps.has(key)) return;
+        await applyAcceptedOp(room, envelope.seq, envelope.op, envelope.nodeId);
+      }
+
+      if (envelope.kind === "awareness_update" && envelope.user?.socketId) {
+        room.awareness.set(envelope.user.socketId, envelope.user);
+        broadcastAwareness(room, { user: envelope.user });
+      }
+
+      if (envelope.kind === "awareness_remove" && envelope.socketId) {
+        room.awareness.delete(envelope.socketId);
+        broadcast(room, {
+          kind: "awareness_remove",
+          tenantId: room.tenantId,
+          roomId: room.roomId,
+          socketId: envelope.socketId,
+          siteId: envelope.siteId || "",
+          userId: envelope.userId || ""
+        });
+      }
+    });
+
+    bus.enabled = true;
+    bus.publisher = publisher;
+    bus.subscriber = subscriber;
+
+    bus.seqIncr = async (roomKey) => {
+      const n = await publisher.incr(`${redisSeqPrefix}:${roomKey}`);
+      return Number(n);
+    };
+
+    bus.publishRoomEvent = async (room, payload) => {
+      const channel = `${redisChannelPrefix}:${room.key}`;
+      const envelope = {
+        v: PROTOCOL_VERSION,
+        nodeId,
+        ts: now(),
+        tenantId: room.tenantId,
+        roomId: room.roomId,
+        ...payload
+      };
+      await publisher.publish(channel, JSON.stringify(envelope));
+      metrics.redisBusPublished += 1;
+    };
+
+    bus.close = async () => {
+      await Promise.allSettled([publisher.quit(), subscriber.quit()]);
+    };
+
+    console.log(`[relay] redis bus enabled (${redisUrl})`);
+  })();
+
+  await bus.connecting;
+}
+
 const server = http.createServer((req, res) => {
   if (!req.url) {
     res.writeHead(400, { "content-type": "application/json" });
@@ -563,18 +822,28 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/healthz") {
     const stats = roomStats();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, ts: now(), wsPath, rooms: stats.roomCount, clients: stats.clientCount }));
+    res.end(
+      JSON.stringify({
+        ok: true,
+        v: PROTOCOL_VERSION,
+        ts: now(),
+        wsPath,
+        rooms: stats.roomCount,
+        clients: stats.clientCount,
+        busEnabled: bus.enabled
+      })
+    );
     return;
   }
 
   if (url.pathname === "/readyz") {
     if (shuttingDown) {
       res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, shuttingDown: true }));
+      res.end(JSON.stringify({ ok: false, shuttingDown: true, v: PROTOCOL_VERSION }));
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, shuttingDown: false }));
+    res.end(JSON.stringify({ ok: true, shuttingDown: false, v: PROTOCOL_VERSION }));
     return;
   }
 
@@ -584,9 +853,11 @@ const server = http.createServer((req, res) => {
     res.end(
       JSON.stringify({
         ts: now(),
+        protocolVersion: PROTOCOL_VERSION,
         config: {
           port,
           wsPath,
+          dataDir,
           maxHistory,
           maxRoomClients,
           maxRoomsPerTenant,
@@ -599,7 +870,8 @@ const server = http.createServer((req, res) => {
           roomIdleTtlMs,
           roomGcIntervalMs,
           allowedOrigins,
-          authEnabled: !!globalAuthToken || Object.keys(tenantTokens).length > 0
+          authEnabled: !!globalAuthToken || Object.keys(tenantTokens).length > 0,
+          redisBusEnabled: bus.enabled
         },
         stats,
         tenants: Object.fromEntries(tenantStats),
@@ -615,7 +887,13 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
-server.on("upgrade", (request, socket, head) => {
+server.on("upgrade", async (request, socket, head) => {
+  if (shuttingDown) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\nshutting_down");
+    socket.destroy();
+    return;
+  }
+
   const url = new URL(request.url || "/", `http://${request.headers.host}`);
 
   if (url.pathname !== wsPath) {
@@ -651,7 +929,7 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
-  const room = getOrCreateRoom(normalized.tenant, normalized.room);
+  const room = await getOrCreateRoom(normalized.tenant, normalized.room);
   if (!room) {
     metrics.connectionsRejected += 1;
     socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\nroom_limit");
@@ -711,11 +989,7 @@ server.on("close", () => {
   clearInterval(gcTimer);
 });
 
-server.listen(port, () => {
-  console.log(`SyncPad relay listening on http://localhost:${port} (ws path: ${wsPath})`);
-});
-
-function gracefulShutdown(signal) {
+async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[relay] received ${signal}, starting graceful shutdown`);
@@ -736,17 +1010,32 @@ function gracefulShutdown(signal) {
   }, 8000);
   forceExitTimer.unref();
 
-  server.close((err) => {
+  server.close(async (err) => {
     clearTimeout(forceExitTimer);
     if (err) {
       console.error("[relay] shutdown error", err);
       process.exit(1);
       return;
     }
+
+    await Promise.allSettled([...rooms.values()].map((room) => room.writeQueue));
+    await bus.close();
+
     console.log("[relay] graceful shutdown complete");
     process.exit(0);
   });
 }
 
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => {
+  void gracefulShutdown("SIGINT");
+});
+process.on("SIGTERM", () => {
+  void gracefulShutdown("SIGTERM");
+});
+
+await ensureDataDir();
+await initRedisBus();
+
+server.listen(port, () => {
+  console.log(`SyncPad relay listening on http://localhost:${port} (ws path: ${wsPath}, v=${PROTOCOL_VERSION})`);
+});
