@@ -154,6 +154,8 @@ export default function App() {
   const logRef = useRef([]);
   const outboxRef = useRef([]);
   const initializedRef = useRef(false);
+  const renderQueuedRef = useRef(false);
+  const persistTimerRef = useRef(null);
 
   const blocks = docRef.current.getBlocks();
 
@@ -166,8 +168,35 @@ export default function App() {
     lamportRef.current = Math.max(lamportRef.current, maxLamportFromOp(op));
   }
 
-  function persistLog() {
+  function scheduleRender() {
+    if (renderQueuedRef.current) return;
+    renderQueuedRef.current = true;
+
+    window.requestAnimationFrame(() => {
+      renderQueuedRef.current = false;
+      setRev((v) => v + 1);
+    });
+  }
+
+  function flushPersistNow() {
     writeJson(storage.log, logRef.current);
+    writeJson(storage.outbox, outboxRef.current);
+    if (persistTimerRef.current) {
+      window.clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+  }
+
+  function schedulePersist() {
+    if (persistTimerRef.current) return;
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      flushPersistNow();
+    }, 150);
+  }
+
+  function persistLog() {
+    schedulePersist();
   }
 
   function appendLog(op) {
@@ -179,7 +208,7 @@ export default function App() {
   }
 
   function persistOutbox() {
-    writeJson(storage.outbox, outboxRef.current);
+    schedulePersist();
   }
 
   function queueOutbox(op) {
@@ -265,7 +294,7 @@ export default function App() {
     absorbLamport(op);
     if (changed) {
       if (persist) appendLog(op);
-      setRev((v) => v + 1);
+      scheduleRender();
     }
     return changed;
   }
@@ -556,7 +585,7 @@ export default function App() {
 
     lamportRef.current = maxLamport;
     initializedRef.current = true;
-    setRev((v) => v + 1);
+    scheduleRender();
   }, [storage]);
 
   useEffect(() => {
@@ -634,8 +663,18 @@ export default function App() {
       stopped = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       socketRef.current?.close();
+      flushPersistNow();
     };
   }, [siteId, storage]);
+
+  useEffect(() => {
+    function onBeforeUnload() {
+      flushPersistNow();
+    }
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [storage]);
 
   useEffect(() => {
     function onKeyDown(event) {

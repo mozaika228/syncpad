@@ -219,6 +219,21 @@ function safeSend(socket, payload) {
   }
 }
 
+function safeSendSerialized(socket, serialized) {
+  if (socket.readyState !== socket.OPEN) return false;
+  if (socket.bufferedAmount > maxBufferedBytes) {
+    metrics.messagesDroppedBackpressure += 1;
+    return false;
+  }
+
+  try {
+    socket.send(serialized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function rejectSocket(socket, code, reason) {
   try {
     safeSend(socket, { kind: "error", code, reason });
@@ -252,8 +267,9 @@ function rateAllowed(socket, bytes) {
 }
 
 function broadcast(room, payload) {
+  const serialized = JSON.stringify(payload);
   for (const socket of room.clients) {
-    const sent = safeSend(socket, payload);
+    const sent = safeSendSerialized(socket, serialized);
     if (sent) metrics.messagesBroadcast += 1;
   }
 }

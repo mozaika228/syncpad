@@ -83,6 +83,15 @@ node shared/test/rich-crdt.snapshot.test.js
 - `MAX_BYTES_PER_SECOND_PER_SOCKET=524288`: per-socket byte rate limiter.
 - `MAX_ROOMS_PER_TENANT=500`, `MAX_CLIENTS_PER_TENANT=2000`: tenant quotas.
 
+## Performance tuning
+
+- Client:
+  - CRDT apply now batches UI commits via `requestAnimationFrame` (reduces rerender storms during history replay and burst typing).
+  - Local persistence (`op-log`, `outbox`) is debounced and flushed on `beforeunload`.
+- Server relay:
+  - Broadcast path serializes payload once per fanout (instead of `JSON.stringify` per socket).
+  - Backpressure drop guard remains enabled (`MAX_BUFFERED_BYTES`).
+
 ## Current limits
 
 - Relay history is in-memory only (no server-side durable persistence yet)
