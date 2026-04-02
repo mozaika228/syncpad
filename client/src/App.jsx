@@ -2,10 +2,13 @@
 import {
   GENESIS_BLOCK_ID,
   RichTextDocument,
+  countTombstones,
+  createCompactedSnapshot,
   computeSingleSpanDiff,
   createSiteId,
   idKey,
-  maxLamportFromOp
+  maxLamportFromOp,
+  restoreFromCompactedSnapshot
 } from "../../shared/src/rich-crdt";
 
 const ROOM = "default";
@@ -118,7 +121,8 @@ export default function App() {
     () => ({
       log: `${STORAGE_NS}:log:${ROOM}:${siteId}`,
       outbox: `${STORAGE_NS}:outbox:${ROOM}:${siteId}`,
-      seq: `${STORAGE_NS}:seq:${ROOM}:${siteId}`
+      seq: `${STORAGE_NS}:seq:${ROOM}:${siteId}`,
+      snapshot: `${STORAGE_NS}:snapshot:${ROOM}:${siteId}`
     }),
     [siteId]
   );
@@ -182,6 +186,30 @@ export default function App() {
     }
   }
 
+  function maybeCompactLocalState(reason) {
+    if (outboxRef.current.length > 0) return;
+
+    const tombstones = countTombstones(docRef.current);
+    if (logRef.current.length < 2000 && tombstones.total < 1000) {
+      return;
+    }
+
+    const snapshot = createCompactedSnapshot(docRef.current, {
+      room: ROOM,
+      siteId,
+      seq: lastSeqRef.current,
+      lamport: lamportRef.current,
+      compactedAt: Date.now(),
+      reason
+    });
+    writeJson(storage.snapshot, snapshot);
+
+    logRef.current = [];
+    persistLog();
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+  }
+
   function emit(op) {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -232,6 +260,7 @@ export default function App() {
     }
 
     removeOutboxByOpId(op?.opId);
+    maybeCompactLocalState("server_seq_advance");
   }
 
   function makeOpFromDescriptor(desc) {
@@ -346,6 +375,7 @@ export default function App() {
     }
 
     flushOutbox();
+    maybeCompactLocalState("local_ops");
   }
 
   function executeDescriptorBatch(batch, pushUndo, clearRedo) {
@@ -467,13 +497,23 @@ export default function App() {
   useEffect(() => {
     if (initializedRef.current) return;
 
+    const loadedSnapshot = readJson(storage.snapshot, null);
     const loadedLog = readJson(storage.log, []);
     const loadedOutbox = readJson(storage.outbox, []);
     const loadedSeq = readNumber(storage.seq, 0);
 
+    if (loadedSnapshot) {
+      docRef.current = restoreFromCompactedSnapshot(loadedSnapshot);
+      lamportRef.current = Math.max(
+        lamportRef.current,
+        Number(loadedSnapshot?.meta?.lamport || 0)
+      );
+    }
+
     logRef.current = Array.isArray(loadedLog) ? loadedLog : [];
     outboxRef.current = Array.isArray(loadedOutbox) ? loadedOutbox : [];
-    lastSeqRef.current = loadedSeq;
+    const snapshotSeq = Number(loadedSnapshot?.meta?.seq || 0);
+    lastSeqRef.current = Math.max(loadedSeq, Number.isFinite(snapshotSeq) ? snapshotSeq : 0);
 
     let maxLamport = 0;
     for (const op of logRef.current) {

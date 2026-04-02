@@ -41,6 +41,14 @@ function cloneClock(clock) {
   return { lamport: clock.lamport, site: clock.site };
 }
 
+function cloneAttrClocks(attrClocks = {}) {
+  return Object.fromEntries(
+    Object.entries(attrClocks)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, clock]) => [name, cloneClock(clock)])
+  );
+}
+
 class InlineCrdt {
   constructor() {
     this.nodes = new Map();
@@ -574,4 +582,176 @@ export function getCanonicalState(doc) {
       textByBlock: [...doc.pendingTextOpsByBlock.values()].reduce((acc, xs) => acc + xs.length, 0)
     }
   };
+}
+
+export function countTombstones(doc) {
+  const deletedBlocks = doc.linearizedBlocks().filter((b) => !idsEqual(b.id, BLOCK_ROOT_ID) && b.deleted).length;
+  let deletedChars = 0;
+
+  for (const [blockKey, inline] of doc.textByBlock.entries()) {
+    if (!inline || blockKey === idKey(BLOCK_ROOT_ID)) continue;
+    for (const node of inline.nodes.values()) {
+      if (idsEqual(node.id, INLINE_ROOT_ID)) continue;
+      if (node.deleted) deletedChars += 1;
+    }
+  }
+
+  return {
+    deletedBlocks,
+    deletedChars,
+    total: deletedBlocks + deletedChars
+  };
+}
+
+export function createCompactedSnapshot(doc, meta = {}) {
+  const visibleBlocks = doc.visibleBlocks();
+  const blockItems = [];
+
+  for (let i = 0; i < visibleBlocks.length; i += 1) {
+    const block = visibleBlocks[i];
+    const inline = doc.textByBlock.get(idKey(block.id));
+    const visibleNodes = inline ? inline.visible() : [];
+
+    const inlineNodes = [];
+    for (let j = 0; j < visibleNodes.length; j += 1) {
+      const node = visibleNodes[j];
+      const after = j === 0 ? cloneId(INLINE_ROOT_ID) : cloneId(visibleNodes[j - 1].id);
+      inlineNodes.push({
+        id: cloneId(node.id),
+        after,
+        value: node.value,
+        attrs: normalizeAttrs(node.attrs),
+        attrClocks: cloneAttrClocks(node.attrClocks || {})
+      });
+    }
+
+    const afterBlock = i === 0 ? cloneId(BLOCK_ROOT_ID) : cloneId(visibleBlocks[i - 1].id);
+    blockItems.push({
+      id: cloneId(block.id),
+      after: afterBlock,
+      type: normalizeBlockType(block.type),
+      typeClock: cloneClock(block.typeClock),
+      inlineNodes
+    });
+  }
+
+  return {
+    version: 1,
+    meta: {
+      ...meta,
+      tombstonesBeforeCompaction: countTombstones(doc)
+    },
+    blocks: blockItems
+  };
+}
+
+function buildInlineFromSnapshot(nodes = []) {
+  const inline = new InlineCrdt();
+  inline.nodes = new Map();
+  inline.children = new Map();
+  inline.pendingInserts = new Map();
+  inline.pendingDeletes = new Map();
+  inline.pendingFormats = new Map();
+
+  inline.nodes.set(idKey(INLINE_ROOT_ID), {
+    id: INLINE_ROOT_ID,
+    after: null,
+    value: "",
+    deleted: true,
+    attrs: normalizeAttrs(),
+    attrClocks: {}
+  });
+  inline.children.set(idKey(INLINE_ROOT_ID), []);
+
+  for (const rawNode of nodes) {
+    if (!rawNode?.id || !rawNode?.after) continue;
+    inline.nodes.set(idKey(rawNode.id), {
+      id: cloneId(rawNode.id),
+      after: cloneId(rawNode.after),
+      value: typeof rawNode.value === "string" && rawNode.value.length > 0 ? rawNode.value[0] : " ",
+      deleted: false,
+      attrs: normalizeAttrs(rawNode.attrs),
+      attrClocks: cloneAttrClocks(rawNode.attrClocks || {})
+    });
+  }
+
+  for (const node of inline.nodes.values()) {
+    if (idsEqual(node.id, INLINE_ROOT_ID)) continue;
+    const parentKey = idKey(node.after);
+    if (!inline.children.has(parentKey)) inline.children.set(parentKey, []);
+    inline.children.get(parentKey).push(cloneId(node.id));
+    if (!inline.children.has(idKey(node.id))) inline.children.set(idKey(node.id), []);
+  }
+
+  for (const children of inline.children.values()) {
+    children.sort(compareId);
+  }
+
+  return inline;
+}
+
+export function restoreFromCompactedSnapshot(snapshot) {
+  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.blocks)) {
+    return new RichTextDocument();
+  }
+
+  const doc = new RichTextDocument();
+  doc.blocks = new Map();
+  doc.blockChildren = new Map();
+  doc.textByBlock = new Map();
+  doc.seenOps = new Set();
+  doc.pendingBlockInserts = new Map();
+  doc.pendingBlockDeletes = new Map();
+  doc.pendingBlockFormats = new Map();
+  doc.pendingTextOpsByBlock = new Map();
+
+  doc.blocks.set(idKey(BLOCK_ROOT_ID), {
+    id: BLOCK_ROOT_ID,
+    after: null,
+    type: "root",
+    deleted: true,
+    typeClock: null
+  });
+  doc.blockChildren.set(idKey(BLOCK_ROOT_ID), []);
+
+  const blocks = snapshot.blocks;
+  for (let i = 0; i < blocks.length; i += 1) {
+    const rawBlock = blocks[i];
+    if (!rawBlock?.id) continue;
+
+    const after = i === 0 ? cloneId(BLOCK_ROOT_ID) : cloneId(blocks[i - 1].id);
+    const block = {
+      id: cloneId(rawBlock.id),
+      after,
+      type: normalizeBlockType(rawBlock.type),
+      deleted: false,
+      typeClock: cloneClock(rawBlock.typeClock)
+    };
+
+    doc.blocks.set(idKey(block.id), block);
+    if (!doc.blockChildren.has(idKey(after))) doc.blockChildren.set(idKey(after), []);
+    doc.blockChildren.get(idKey(after)).push(cloneId(block.id));
+    if (!doc.blockChildren.has(idKey(block.id))) doc.blockChildren.set(idKey(block.id), []);
+    doc.textByBlock.set(idKey(block.id), buildInlineFromSnapshot(rawBlock.inlineNodes || []));
+  }
+
+  if (!doc.blocks.has(idKey(GENESIS_BLOCK_ID))) {
+    const genesis = {
+      id: GENESIS_BLOCK_ID,
+      after: BLOCK_ROOT_ID,
+      type: "paragraph",
+      deleted: false,
+      typeClock: null
+    };
+    doc.blocks.set(idKey(GENESIS_BLOCK_ID), genesis);
+    doc.blockChildren.get(idKey(BLOCK_ROOT_ID)).unshift(cloneId(GENESIS_BLOCK_ID));
+    if (!doc.blockChildren.has(idKey(GENESIS_BLOCK_ID))) doc.blockChildren.set(idKey(GENESIS_BLOCK_ID), []);
+    doc.textByBlock.set(idKey(GENESIS_BLOCK_ID), new InlineCrdt());
+  }
+
+  for (const children of doc.blockChildren.values()) {
+    children.sort(compareId);
+  }
+
+  return doc;
 }
