@@ -34,6 +34,7 @@ const tenantTokens = (() => {
 const rooms = new Map();
 const tenantStats = new Map();
 let socketSeq = 0;
+let shuttingDown = false;
 
 const metrics = {
   connectionsAccepted: 0,
@@ -566,6 +567,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url.pathname === "/readyz") {
+    if (shuttingDown) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, shuttingDown: true }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, shuttingDown: false }));
+    return;
+  }
+
   if (url.pathname === "/metrics") {
     const stats = roomStats();
     res.writeHead(200, { "content-type": "application/json" });
@@ -702,3 +714,39 @@ server.on("close", () => {
 server.listen(port, () => {
   console.log(`SyncPad relay listening on http://localhost:${port} (ws path: ${wsPath})`);
 });
+
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[relay] received ${signal}, starting graceful shutdown`);
+
+  for (const room of rooms.values()) {
+    for (const socket of room.clients) {
+      try {
+        socket.close(1001, "server_shutdown");
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+
+  const forceExitTimer = setTimeout(() => {
+    console.error("[relay] force exiting after shutdown timeout");
+    process.exit(1);
+  }, 8000);
+  forceExitTimer.unref();
+
+  server.close((err) => {
+    clearTimeout(forceExitTimer);
+    if (err) {
+      console.error("[relay] shutdown error", err);
+      process.exit(1);
+      return;
+    }
+    console.log("[relay] graceful shutdown complete");
+    process.exit(0);
+  });
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));

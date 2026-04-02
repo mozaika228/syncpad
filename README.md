@@ -42,6 +42,7 @@ Services:
 - client: `http://localhost:5173`
 - ws relay: `ws://localhost:8080`
 - health: `http://localhost:8080/healthz`
+- ready: `http://localhost:8080/readyz`
 - metrics: `http://localhost:8080/metrics`
 
 Client can pass tenant/session context via query params:
@@ -61,6 +62,18 @@ Run checks directly:
 node shared/test/crdt.convergence.test.js
 node shared/test/rich-crdt.convergence.test.js
 node shared/test/rich-crdt.snapshot.test.js
+```
+
+Engineering runbook:
+
+- `docs/ENGINEERING_RUNBOOK.md`
+
+Unified project commands:
+
+```bash
+npm run check
+npm run test
+npm run ci
 ```
 
 ## Protocol (MVP)
@@ -87,6 +100,7 @@ node shared/test/rich-crdt.snapshot.test.js
 - `MAX_OPS_PER_SECOND_PER_SOCKET=400`: per-socket op rate limiter.
 - `MAX_BYTES_PER_SECOND_PER_SOCKET=524288`: per-socket byte rate limiter.
 - `MAX_ROOMS_PER_TENANT=500`, `MAX_CLIENTS_PER_TENANT=2000`: tenant quotas.
+- Complete env template: `.env.example`
 
 ## Performance tuning
 
