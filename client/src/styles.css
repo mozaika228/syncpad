@@ -100,6 +100,32 @@ body {
   margin: 0 0.1rem;
 }
 
+.awareness-bar {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.8rem;
+}
+
+.awareness-title {
+  font-size: 0.85rem;
+  color: #5b524a;
+}
+
+.awareness-empty {
+  font-size: 0.84rem;
+  color: #7b7167;
+}
+
+.awareness-chip {
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -158,6 +184,26 @@ textarea {
 
 .block-row input {
   font-family: "IBM Plex Mono", "Consolas", monospace;
+  width: 100%;
+}
+
+.block-input-wrap {
+  position: relative;
+}
+
+.cursor-count {
+  position: absolute;
+  right: 0.45rem;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 1px solid var(--line);
+  background: #fff8d6;
+  color: #705f25;
+  border-radius: 999px;
+  font-size: 0.73rem;
+  min-width: 1.25rem;
+  text-align: center;
+  padding: 0.02rem 0.3rem;
 }
 
 .block-row button {

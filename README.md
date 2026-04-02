@@ -21,6 +21,7 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
   - Collaborative block editor
   - Block type controls and inline formatting controls
   - CRDT-native undo/redo (`Ctrl/Cmd+Z`, `Ctrl+Y` / `Cmd+Shift+Z`) implemented as inverse CRDT operations
+  - Awareness layer (separate from CRDT): live remote cursor/selection presence per block
   - Structured rich preview driven from CRDT state
 
 ## Project structure
@@ -67,11 +68,15 @@ node shared/test/rich-crdt.snapshot.test.js
 - client -> server:
   - `{ kind: "hello", tenantId, roomId, userId, authToken, sinceSeq, siteId }`
   - `{ kind: "op", tenantId, roomId, op }`
+  - `{ kind: "awareness", tenantId, roomId, awareness: { blockKey, start, end, focused } }`
 - server -> client:
   - `{ kind: "history", tenantId, roomId, fromSeq, toSeq, baseSeq, truncated, events: [{ seq, op }] }`
   - `{ kind: "op", tenantId, roomId, seq, op }`
   - `{ kind: "ack", tenantId, roomId, seq, opId }`
   - `{ kind: "presence", tenantId, roomId, users }`
+  - `{ kind: "awareness_snapshot", tenantId, roomId, users: [...] }`
+  - `{ kind: "awareness_update", tenantId, roomId, user }`
+  - `{ kind: "awareness_remove", tenantId, roomId, socketId, siteId, userId }`
   - `{ kind: "error", code, reason }`
 
 ## Security / Multi-tenant env
@@ -95,6 +100,7 @@ node shared/test/rich-crdt.snapshot.test.js
 ## Current limits
 
 - Relay history is in-memory only (no server-side durable persistence yet)
+- Awareness is ephemeral and in-memory only (no replay from durable store by design)
 - Server-side snapshot compaction is not implemented yet (current GC/compaction is client-local)
 - Undo restore for deleted blocks currently recreates block shell (type) without restoring full deleted block text payload
 - Block split/merge UX is intentionally minimal in this iteration

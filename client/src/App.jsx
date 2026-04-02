@@ -130,6 +130,7 @@ export default function App() {
   const [marks, setMarks] = useState({ bold: false, italic: false, underline: false });
   const [activeBlockKey, setActiveBlockKey] = useState("");
   const [selection, setSelection] = useState({ start: 0, end: 0 });
+  const [awarenessMap, setAwarenessMap] = useState({});
 
   const siteId = useMemo(() => getStableSiteId(`${RUNTIME.tenantId}:${RUNTIME.roomId}`), []);
   const storage = useMemo(
@@ -156,6 +157,9 @@ export default function App() {
   const initializedRef = useRef(false);
   const renderQueuedRef = useRef(false);
   const persistTimerRef = useRef(null);
+
+  const localAwarenessRef = useRef({ blockKey: "", start: 0, end: 0, focused: false });
+  const awarenessTimerRef = useRef(null);
 
   const blocks = docRef.current.getBlocks();
 
@@ -234,9 +238,7 @@ export default function App() {
     if (outboxRef.current.length > 0) return;
 
     const tombstones = countTombstones(docRef.current);
-    if (logRef.current.length < 2000 && tombstones.total < 1000) {
-      return;
-    }
+    if (logRef.current.length < 2000 && tombstones.total < 1000) return;
 
     const snapshot = createCompactedSnapshot(docRef.current, {
       tenantId: RUNTIME.tenantId,
@@ -255,38 +257,70 @@ export default function App() {
     redoStackRef.current = [];
   }
 
-  function emit(op) {
+  function sendRaw(payload) {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(
-      JSON.stringify({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op })
-    );
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  }
+
+  function emit(op) {
+    sendRaw({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op });
   }
 
   function flushOutbox() {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     for (const op of outboxRef.current) {
-      socket.send(
-        JSON.stringify({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op })
-      );
+      sendRaw({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op });
     }
   }
 
   function sendHello() {
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(
-      JSON.stringify({
-        kind: "hello",
-        tenantId: RUNTIME.tenantId,
-        roomId: RUNTIME.roomId,
-        userId: RUNTIME.userId,
-        authToken: RUNTIME.authToken,
-        sinceSeq: lastSeqRef.current,
-        siteId
-      })
-    );
+    sendRaw({
+      kind: "hello",
+      tenantId: RUNTIME.tenantId,
+      roomId: RUNTIME.roomId,
+      userId: RUNTIME.userId,
+      authToken: RUNTIME.authToken,
+      sinceSeq: lastSeqRef.current,
+      siteId
+    });
+  }
+
+  function emitAwareness(force = false) {
+    const state = localAwarenessRef.current;
+    if (!force && !state.focused) return;
+
+    sendRaw({
+      kind: "awareness",
+      tenantId: RUNTIME.tenantId,
+      roomId: RUNTIME.roomId,
+      awareness: {
+        blockKey: state.blockKey,
+        start: state.start,
+        end: state.end,
+        focused: state.focused
+      }
+    });
+  }
+
+  function scheduleAwarenessEmit() {
+    if (awarenessTimerRef.current) return;
+    awarenessTimerRef.current = window.setTimeout(() => {
+      awarenessTimerRef.current = null;
+      emitAwareness(false);
+    }, 80);
+  }
+
+  function setLocalAwareness(next) {
+    localAwarenessRef.current = {
+      blockKey: next.blockKey ?? localAwarenessRef.current.blockKey,
+      start: Number.isInteger(next.start) ? Math.max(0, next.start) : localAwarenessRef.current.start,
+      end: Number.isInteger(next.end) ? Math.max(0, next.end) : localAwarenessRef.current.end,
+      focused: typeof next.focused === "boolean" ? next.focused : localAwarenessRef.current.focused
+    };
+    scheduleAwarenessEmit();
   }
 
   function applyAndRender(op, persist = true) {
@@ -325,15 +359,9 @@ export default function App() {
   function makeOpFromDescriptor(desc) {
     const opId = { lamport: nextLamport(), site: siteId };
 
-    if (desc.type === "block_insert") {
-      return { type: "block_insert", opId, after: cloneId(desc.after), blockType: desc.blockType };
-    }
-    if (desc.type === "block_delete") {
-      return { type: "block_delete", opId, target: cloneId(desc.target) };
-    }
-    if (desc.type === "block_format") {
-      return { type: "block_format", opId, target: cloneId(desc.target), blockType: desc.blockType };
-    }
+    if (desc.type === "block_insert") return { type: "block_insert", opId, after: cloneId(desc.after), blockType: desc.blockType };
+    if (desc.type === "block_delete") return { type: "block_delete", opId, target: cloneId(desc.target) };
+    if (desc.type === "block_format") return { type: "block_format", opId, target: cloneId(desc.target), blockType: desc.blockType };
     if (desc.type === "text_insert") {
       return {
         type: "text_insert",
@@ -344,9 +372,7 @@ export default function App() {
         attrs: cloneAttrs(desc.attrs)
       };
     }
-    if (desc.type === "text_delete") {
-      return { type: "text_delete", opId, block: cloneId(desc.block), target: cloneId(desc.target) };
-    }
+    if (desc.type === "text_delete") return { type: "text_delete", opId, block: cloneId(desc.block), target: cloneId(desc.target) };
     if (desc.type === "text_format") {
       return {
         type: "text_format",
@@ -361,20 +387,12 @@ export default function App() {
   }
 
   function buildInverseDescriptors(op) {
-    if (op.type === "block_insert") {
-      return [{ type: "block_delete", target: cloneId(op.opId) }];
-    }
+    if (op.type === "block_insert") return [{ type: "block_delete", target: cloneId(op.opId) }];
 
     if (op.type === "block_delete") {
       const block = docRef.current.blocks.get(idKey(op.target));
       if (!block || idKey(block.id) === idKey(GENESIS_BLOCK_ID)) return [];
-      return [
-        {
-          type: "block_insert",
-          after: cloneId(block.after),
-          blockType: block.type
-        }
-      ];
+      return [{ type: "block_insert", after: cloneId(block.after), blockType: block.type }];
     }
 
     if (op.type === "block_format") {
@@ -383,23 +401,13 @@ export default function App() {
       return [{ type: "block_format", target: cloneId(op.target), blockType: block.type }];
     }
 
-    if (op.type === "text_insert") {
-      return [{ type: "text_delete", block: cloneId(op.block), target: cloneId(op.opId) }];
-    }
+    if (op.type === "text_insert") return [{ type: "text_delete", block: cloneId(op.block), target: cloneId(op.opId) }];
 
     if (op.type === "text_delete") {
       const inline = docRef.current.textByBlock.get(idKey(op.block));
       const node = inline?.nodes.get(idKey(op.target));
       if (!inline || !node) return [];
-      return [
-        {
-          type: "text_insert",
-          block: cloneId(op.block),
-          after: cloneId(node.after),
-          value: node.value,
-          attrs: cloneAttrs(node.attrs)
-        }
-      ];
+      return [{ type: "text_insert", block: cloneId(op.block), after: cloneId(node.after), value: node.value, attrs: cloneAttrs(node.attrs) }];
     }
 
     if (op.type === "text_format") {
@@ -407,9 +415,7 @@ export default function App() {
       const node = inline?.nodes.get(idKey(op.target));
       if (!inline || !node) return [];
       const prev = {};
-      for (const key of Object.keys(op.attrs || {})) {
-        prev[key] = !!node.attrs[key];
-      }
+      for (const key of Object.keys(op.attrs || {})) prev[key] = !!node.attrs[key];
       return [{ type: "text_format", block: cloneId(op.block), target: cloneId(op.target), attrs: prev }];
     }
 
@@ -460,10 +466,7 @@ export default function App() {
       emit(op);
     }
 
-    if (redoBatch.length > 0) {
-      redoStackRef.current.push(redoBatch);
-    }
-
+    if (redoBatch.length > 0) redoStackRef.current.push(redoBatch);
     flushOutbox();
   }
 
@@ -487,7 +490,6 @@ export default function App() {
       ops.push(op);
     }
     executeLocalOps(ops, true, true);
-
     setMarks((m) => ({ ...m, [attr]: nextValue }));
   }
 
@@ -527,14 +529,7 @@ export default function App() {
     if (delta.inserted.length > 0) {
       const ops = [];
       for (let i = 0; i < delta.inserted.length; i += 1) {
-        const op = docRef.current.makeInsertTextOp(
-          blockId,
-          delta.start + i,
-          delta.inserted[i],
-          siteId,
-          nextLamport(),
-          marks
-        );
+        const op = docRef.current.makeInsertTextOp(blockId, delta.start + i, delta.inserted[i], siteId, nextLamport(), marks);
         if (!op) continue;
         ops.push(op);
       }
@@ -546,11 +541,17 @@ export default function App() {
   }
 
   function updateSelection(event, blockId) {
-    setActiveBlockKey(idKey(blockId));
-    setSelection({
-      start: event.target.selectionStart || 0,
-      end: event.target.selectionEnd || 0
-    });
+    const start = event.target.selectionStart || 0;
+    const end = event.target.selectionEnd || 0;
+    const blockKey = idKey(blockId);
+
+    setActiveBlockKey(blockKey);
+    setSelection({ start, end });
+    setLocalAwareness({ blockKey, start, end, focused: true });
+  }
+
+  function onInputBlur() {
+    setLocalAwareness({ focused: false });
   }
 
   useEffect(() => {
@@ -563,10 +564,7 @@ export default function App() {
 
     if (loadedSnapshot) {
       docRef.current = restoreFromCompactedSnapshot(loadedSnapshot);
-      lamportRef.current = Math.max(
-        lamportRef.current,
-        Number(loadedSnapshot?.meta?.lamport || 0)
-      );
+      lamportRef.current = Math.max(lamportRef.current, Number(loadedSnapshot?.meta?.lamport || 0));
     }
 
     logRef.current = Array.isArray(loadedLog) ? loadedLog : [];
@@ -603,13 +601,13 @@ export default function App() {
         setStatus("online");
         sendHello();
         flushOutbox();
+        emitAwareness(true);
       });
 
       socket.addEventListener("close", () => {
         setStatus("offline");
-        if (!stopped) {
-          reconnectTimer = window.setTimeout(connect, 1500);
-        }
+        setAwarenessMap({});
+        if (!stopped) reconnectTimer = window.setTimeout(connect, 1500);
       });
 
       socket.addEventListener("error", () => {
@@ -624,11 +622,16 @@ export default function App() {
           return;
         }
 
+        if (
+          payload.tenantId &&
+          (payload.tenantId !== RUNTIME.tenantId || payload.roomId !== RUNTIME.roomId)
+        ) {
+          return;
+        }
+
         if (payload.kind === "history" && Array.isArray(payload.events)) {
           const events = payload.events.slice().sort((a, b) => a.seq - b.seq);
-          for (const entry of events) {
-            applyServerEntry(entry.seq, entry.op);
-          }
+          for (const entry of events) applyServerEntry(entry.seq, entry.op);
           return;
         }
 
@@ -651,6 +654,32 @@ export default function App() {
           return;
         }
 
+        if (payload.kind === "awareness_snapshot" && Array.isArray(payload.users)) {
+          const next = {};
+          for (const user of payload.users) {
+            if (!user?.socketId) continue;
+            if (user.siteId === siteId) continue;
+            next[user.socketId] = user;
+          }
+          setAwarenessMap(next);
+          return;
+        }
+
+        if (payload.kind === "awareness_update" && payload.user?.socketId) {
+          if (payload.user.siteId === siteId) return;
+          setAwarenessMap((prev) => ({ ...prev, [payload.user.socketId]: payload.user }));
+          return;
+        }
+
+        if (payload.kind === "awareness_remove" && payload.socketId) {
+          setAwarenessMap((prev) => {
+            const next = { ...prev };
+            delete next[payload.socketId];
+            return next;
+          });
+          return;
+        }
+
         if (payload.kind === "error") {
           setStatus("offline");
         }
@@ -669,11 +698,19 @@ export default function App() {
 
   useEffect(() => {
     function onBeforeUnload() {
+      setLocalAwareness({ focused: false });
+      emitAwareness(true);
       flushPersistNow();
     }
 
     window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      if (awarenessTimerRef.current) {
+        window.clearTimeout(awarenessTimerRef.current);
+        awarenessTimerRef.current = null;
+      }
+    };
   }, [storage]);
 
   useEffect(() => {
@@ -699,9 +736,7 @@ export default function App() {
     const cache = new Map();
     for (const block of blocks) cache.set(idKey(block.id), block.text);
     blockCacheRef.current = cache;
-    if (!activeBlockKey && blocks.length > 0) {
-      setActiveBlockKey(idKey(blocks[0].id));
-    }
+    if (!activeBlockKey && blocks.length > 0) setActiveBlockKey(idKey(blocks[0].id));
   }, [rev]);
 
   function renderRichBlock(block, idx) {
@@ -716,6 +751,13 @@ export default function App() {
     }
     return <p key={`rb-${idx}`} className="rich-p">{content}</p>;
   }
+
+  const awarenessUsers = Object.values(awarenessMap).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const byBlockAwareness = awarenessUsers.reduce((acc, user) => {
+    if (!user.blockKey || !user.focused) return acc;
+    acc[user.blockKey] = (acc[user.blockKey] || 0) + 1;
+    return acc;
+  }, {});
 
   return (
     <div className="app" data-rev={rev}>
@@ -740,12 +782,26 @@ export default function App() {
         <button type="button" onClick={() => applyInlineFormat("underline")}>U</button>
       </div>
 
+      <div className="awareness-bar">
+        <span className="awareness-title">Live cursors:</span>
+        {awarenessUsers.length === 0 ? (
+          <span className="awareness-empty">no active remote cursors</span>
+        ) : (
+          awarenessUsers.map((user) => (
+            <span key={user.socketId} className="awareness-chip">
+              {user.userId || "anon"} @{user.blockKey || "-"} [{user.start},{user.end}]
+            </span>
+          ))
+        )}
+      </div>
+
       <section className="layout">
         <div className="panel">
           <h2>Collaborative Rich Blocks (CRDT)</h2>
           <div className="blocks-editor">
             {blocks.map((block, index) => {
               const blockKey = idKey(block.id);
+              const activeCount = byBlockAwareness[blockKey] || 0;
               return (
                 <div key={blockKey} className="block-row">
                   <select value={block.type} onChange={(e) => applyBlockType(block.id, e.target.value)}>
@@ -754,15 +810,19 @@ export default function App() {
                     <option value="bullet">Bullet</option>
                   </select>
 
-                  <input
-                    value={block.text}
-                    onFocus={(e) => updateSelection(e, block.id)}
-                    onSelect={(e) => updateSelection(e, block.id)}
-                    onKeyUp={(e) => updateSelection(e, block.id)}
-                    onMouseUp={(e) => updateSelection(e, block.id)}
-                    onChange={(e) => onBlockTextChanged(block.id, e.target.value)}
-                    placeholder="Type text..."
-                  />
+                  <div className="block-input-wrap">
+                    <input
+                      value={block.text}
+                      onFocus={(e) => updateSelection(e, block.id)}
+                      onBlur={onInputBlur}
+                      onSelect={(e) => updateSelection(e, block.id)}
+                      onKeyUp={(e) => updateSelection(e, block.id)}
+                      onMouseUp={(e) => updateSelection(e, block.id)}
+                      onChange={(e) => onBlockTextChanged(block.id, e.target.value)}
+                      placeholder="Type text..."
+                    />
+                    {activeCount > 0 ? <span className="cursor-count">{activeCount}</span> : null}
+                  </div>
 
                   <button type="button" onClick={() => addBlockAfter(block.id)}>+</button>
                   <button type="button" onClick={() => deleteBlock(block.id)} disabled={index === 0}>-</button>

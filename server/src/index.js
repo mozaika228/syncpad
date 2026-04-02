@@ -33,6 +33,7 @@ const tenantTokens = (() => {
 
 const rooms = new Map();
 const tenantStats = new Map();
+let socketSeq = 0;
 
 const metrics = {
   connectionsAccepted: 0,
@@ -41,6 +42,7 @@ const metrics = {
   originRejected: 0,
   rateLimited: 0,
   schemaRejected: 0,
+  awarenessMessages: 0,
   messagesReceived: 0,
   messagesBroadcast: 0,
   messagesDroppedBackpressure: 0,
@@ -124,6 +126,7 @@ function getOrCreateRoom(tenantId, roomId) {
     nextSeq: 1,
     baseSeq: 1,
     seenOps: new Map(),
+    awareness: new Map(),
     createdAt: now(),
     lastActiveAt: now()
   };
@@ -165,15 +168,9 @@ function validateOp(op) {
   if (!op || typeof op !== "object") return false;
   if (!validateId(op.opId)) return false;
 
-  if (op.type === "block_insert") {
-    return validateId(op.after) && typeof op.blockType === "string";
-  }
-  if (op.type === "block_delete") {
-    return validateId(op.target);
-  }
-  if (op.type === "block_format") {
-    return validateId(op.target) && typeof op.blockType === "string";
-  }
+  if (op.type === "block_insert") return validateId(op.after) && typeof op.blockType === "string";
+  if (op.type === "block_delete") return validateId(op.target);
+  if (op.type === "block_format") return validateId(op.target) && typeof op.blockType === "string";
   if (op.type === "text_insert") {
     return (
       validateId(op.block) &&
@@ -183,24 +180,27 @@ function validateOp(op) {
       validateAttrs(op.attrs || {})
     );
   }
-  if (op.type === "text_delete") {
-    return validateId(op.block) && validateId(op.target);
-  }
-  if (op.type === "text_format") {
-    return validateId(op.block) && validateId(op.target) && validateAttrs(op.attrs || {});
-  }
+  if (op.type === "text_delete") return validateId(op.block) && validateId(op.target);
+  if (op.type === "text_format") return validateId(op.block) && validateId(op.target) && validateAttrs(op.attrs || {});
   return false;
+}
+
+function validateAwareness(awareness) {
+  if (!awareness || typeof awareness !== "object") return false;
+  if (awareness.blockKey != null && (typeof awareness.blockKey !== "string" || awareness.blockKey.length > 200)) {
+    return false;
+  }
+  if (awareness.start != null && (!Number.isInteger(awareness.start) || awareness.start < 0)) return false;
+  if (awareness.end != null && (!Number.isInteger(awareness.end) || awareness.end < 0)) return false;
+  if (awareness.focused != null && typeof awareness.focused !== "boolean") return false;
+  return true;
 }
 
 function authAllowed(tenantId, token) {
   if (tenantTokens && typeof tenantTokens === "object" && tenantTokens[tenantId]) {
     return token === String(tenantTokens[tenantId]);
   }
-
-  if (globalAuthToken) {
-    return token === globalAuthToken;
-  }
-
+  if (globalAuthToken) return token === globalAuthToken;
   return true;
 }
 
@@ -246,10 +246,7 @@ function rateAllowed(socket, bytes) {
   const ts = now();
   const elapsed = (ts - socket.rate.lastRefillAt) / 1000;
 
-  socket.rate.opsTokens = Math.min(
-    maxOpsPerSecondPerSocket,
-    socket.rate.opsTokens + elapsed * maxOpsPerSecondPerSocket
-  );
+  socket.rate.opsTokens = Math.min(maxOpsPerSecondPerSocket, socket.rate.opsTokens + elapsed * maxOpsPerSecondPerSocket);
   socket.rate.bytesTokens = Math.min(
     maxBytesPerSecondPerSocket,
     socket.rate.bytesTokens + elapsed * maxBytesPerSecondPerSocket
@@ -283,14 +280,28 @@ function sendPresence(room) {
   });
 }
 
-function historySliceFromSeq(room, sinceSeq) {
-  if (room.history.length === 0) {
-    return { events: [], truncated: false };
-  }
+function broadcastAwareness(room, payload) {
+  metrics.awarenessMessages += 1;
+  broadcast(room, {
+    kind: "awareness_update",
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    ...payload
+  });
+}
 
-  if (sinceSeq < room.baseSeq - 1) {
-    return { events: room.history.slice(), truncated: true };
-  }
+function sendAwarenessSnapshot(socket, room) {
+  safeSend(socket, {
+    kind: "awareness_snapshot",
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    users: [...room.awareness.values()]
+  });
+}
+
+function historySliceFromSeq(room, sinceSeq) {
+  if (room.history.length === 0) return { events: [], truncated: false };
+  if (sinceSeq < room.baseSeq - 1) return { events: room.history.slice(), truncated: true };
 
   const offset = sinceSeq - room.baseSeq + 1;
   const start = Math.max(0, Math.min(offset, room.history.length));
@@ -346,6 +357,7 @@ function handleHello(socket, room, payload) {
   socket.session = {
     ready: true,
     userId: String(payload.userId || socket.bootstrap.userId || "anon"),
+    siteId: String(payload.siteId || socket.bootstrap.siteId || ""),
     tenantId: room.tenantId,
     roomId: room.roomId,
     authTokenPresent: !!token
@@ -365,6 +377,8 @@ function handleHello(socket, room, payload) {
     truncated,
     events
   });
+
+  sendAwarenessSnapshot(socket, room);
 }
 
 function validateOpPayload(payload) {
@@ -415,11 +429,56 @@ function handleOp(socket, room, payload) {
   safeSend(socket, { kind: "ack", tenantId: room.tenantId, roomId: room.roomId, seq, opId: op.opId });
 }
 
+function handleAwareness(socket, room, payload) {
+  if (!socket.session?.ready) {
+    rejectSocket(socket, "hello_required", "hello handshake required before awareness");
+    return;
+  }
+
+  if (!validateAwareness(payload?.awareness)) {
+    metrics.schemaRejected += 1;
+    rejectSocket(socket, "bad_awareness", "awareness payload validation failed");
+    return;
+  }
+
+  const awareness = {
+    socketId: socket.socketId,
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    userId: socket.session.userId,
+    siteId: socket.session.siteId,
+    blockKey: payload.awareness.blockKey || "",
+    start: payload.awareness.start ?? 0,
+    end: payload.awareness.end ?? 0,
+    focused: !!payload.awareness.focused,
+    updatedAt: now()
+  };
+
+  room.awareness.set(socket.socketId, awareness);
+  broadcastAwareness(room, { user: awareness });
+}
+
+function removeAwarenessForSocket(room, socket) {
+  const existing = room.awareness.get(socket.socketId);
+  if (!existing) return;
+
+  room.awareness.delete(socket.socketId);
+  broadcast(room, {
+    kind: "awareness_remove",
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    socketId: socket.socketId,
+    siteId: existing.siteId,
+    userId: existing.userId
+  });
+}
+
 function setupSocket(room, socket, bootstrap) {
   room.clients.add(socket);
   room.lastActiveAt = now();
   incTenantClient(room.tenantId);
 
+  socket.socketId = `s-${++socketSeq}`;
   socket.bootstrap = bootstrap;
   socket.session = { ready: false };
   socket.rate = {
@@ -473,12 +532,18 @@ function setupSocket(room, socket, bootstrap) {
       return;
     }
 
+    if (payload?.kind === "awareness") {
+      handleAwareness(socket, room, payload);
+      return;
+    }
+
     metrics.schemaRejected += 1;
     rejectSocket(socket, "unknown_kind", "unsupported message kind");
   });
 
   socket.on("close", () => {
     room.clients.delete(socket);
+    removeAwarenessForSocket(room, socket);
     decTenantClient(room.tenantId);
     room.lastActiveAt = now();
     sendPresence(room);
@@ -497,15 +562,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/healthz") {
     const stats = roomStats();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        ts: now(),
-        wsPath,
-        rooms: stats.roomCount,
-        clients: stats.clientCount
-      })
-    );
+    res.end(JSON.stringify({ ok: true, ts: now(), wsPath, rooms: stats.roomCount, clients: stats.clientCount }));
     return;
   }
 
@@ -601,6 +658,7 @@ server.on("upgrade", (request, socket, head) => {
     tenantId: normalized.tenant,
     roomId: normalized.room,
     userId: url.searchParams.get("user") || "anon",
+    siteId: url.searchParams.get("siteId") || "",
     authToken: url.searchParams.get("token") || ""
   };
 
