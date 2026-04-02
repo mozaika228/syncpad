@@ -58,6 +58,7 @@ Client can pass tenant/session context via query params:
 - Plain sequence convergence tests: `shared/test/crdt.convergence.test.js`
 - Rich block+inline convergence tests: `shared/test/rich-crdt.convergence.test.js`
 - Snapshot compaction checks: `shared/test/rich-crdt.snapshot.test.js`
+- Chaos/offline branch convergence checks: `shared/test/rich-crdt.chaos.test.js`
 
 Run checks directly:
 
@@ -65,11 +66,14 @@ Run checks directly:
 node shared/test/crdt.convergence.test.js
 node shared/test/rich-crdt.convergence.test.js
 node shared/test/rich-crdt.snapshot.test.js
+node shared/test/rich-crdt.chaos.test.js
 ```
 
 Engineering runbook:
 
 - `docs/ENGINEERING_RUNBOOK.md`
+- `docs/DISASTER_RECOVERY.md`
+- `docs/SRE_OPERATIONS.md`
 
 Unified project commands:
 
@@ -79,6 +83,7 @@ npm run test
 npm run ci
 npm run test:e2e:smoke
 npm run bench:relay
+npm run bench:gate
 ```
 
 ## Protocol (MVP)
@@ -116,6 +121,15 @@ npm run bench:relay
 - Server relay:
   - Broadcast path serializes payload once per fanout (instead of `JSON.stringify` per socket).
   - Backpressure drop guard remains enabled (`MAX_BUFFERED_BYTES`).
+
+## Performance gate
+
+- CI runs relay benchmark and persists `bench-result.json` as artifact.
+- Budget check uses:
+  - `BENCH_MIN_OPS_PER_SEC` (default `250`)
+  - `BENCH_MIN_ACK_RATIO` (default `0.995`)
+  - `BENCH_MAX_ELAPSED_MS` (default `10000`)
+- Gate command: `npm run bench:gate`
 
 ## Current limits
 

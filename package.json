@@ -18,6 +18,7 @@
     "test": "npm run test:crdt",
     "test:e2e:smoke": "node scripts/e2e-smoke.mjs",
     "bench:relay": "node scripts/load-relay.mjs",
+    "bench:gate": "node scripts/perf-budget.mjs",
     "ci": "npm run check && npm run test"
   },
   "devDependencies": {

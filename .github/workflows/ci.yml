@@ -28,3 +28,30 @@ jobs:
 
       - name: Build client
         run: npm run build
+
+      - name: E2E smoke
+        run: npm run test:e2e:smoke
+
+      - name: Relay load benchmark
+        env:
+          BENCH_SPAWN_RELAY: "1"
+          BENCH_PORT: "8092"
+          BENCH_CLIENTS: "8"
+          BENCH_OPS_PER_CLIENT: "80"
+          BENCH_RESULT_FILE: "./bench-result.json"
+        run: npm run bench:relay
+
+      - name: Perf budget gate
+        env:
+          BENCH_RESULT_FILE: "./bench-result.json"
+          BENCH_MIN_OPS_PER_SEC: "250"
+          BENCH_MIN_ACK_RATIO: "0.995"
+          BENCH_MAX_ELAPSED_MS: "10000"
+        run: npm run bench:gate
+
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-bench-result
+          path: bench-result.json

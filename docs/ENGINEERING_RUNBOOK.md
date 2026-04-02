@@ -25,6 +25,7 @@ npm run ci
 ```bash
 npm run test:e2e:smoke
 npm run bench:relay
+npm run bench:gate
 ```
 
 ## Operational endpoints
@@ -50,6 +51,10 @@ npm run bench:relay
    - create ops,
    - restart relay,
    - ensure reconnect clients can recover from persisted room history.
+6. Confirm release gate:
+   - `npm run ci`
+   - `npm run test:e2e:smoke`
+   - benchmark + perf budget gate pass.
 
 ## Incident quick triage
 
@@ -65,3 +70,8 @@ Relay handles `SIGINT`/`SIGTERM` with graceful close:
 - stops accepting new upgrades,
 - closes active sockets,
 - exits after close timeout.
+
+## Companion docs
+
+- DR and migration: `docs/DISASTER_RECOVERY.md`
+- SLO/alerts/abuse: `docs/SRE_OPERATIONS.md`

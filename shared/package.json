@@ -5,6 +5,6 @@
   "type": "module",
   "main": "src/crdt.js",
   "scripts": {
-    "test": "node test/crdt.convergence.test.js && node test/rich-crdt.convergence.test.js && node test/rich-crdt.snapshot.test.js"
+    "test": "node test/crdt.convergence.test.js && node test/rich-crdt.convergence.test.js && node test/rich-crdt.snapshot.test.js && node test/rich-crdt.chaos.test.js"
   }
 }
