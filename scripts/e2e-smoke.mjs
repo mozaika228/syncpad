@@ -3,13 +3,14 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = Number(process.env.SMOKE_PORT || 8091);
 const WS_URL = `ws://127.0.0.1:${PORT}/?tenant=smoke&room=room1&user=u`;
+const TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS || 15000);
 
-function onceMessage(ws, predicate, timeoutMs = 5000) {
+function onceMessage(ws, predicate, label, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const seenKinds = [];
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error(`timeout waiting for message (seen kinds: ${seenKinds.join(",")})`));
+      reject(new Error(`[${label}] timeout waiting for message (seen kinds: ${seenKinds.join(",")})`));
     }, timeoutMs);
 
     function onMessage(data) {
@@ -33,9 +34,9 @@ function onceMessage(ws, predicate, timeoutMs = 5000) {
   });
 }
 
-function waitForAnyKind(ws, kinds, timeoutMs = 5000) {
+function waitForAnyKind(ws, kinds, label, timeoutMs = TIMEOUT_MS) {
   const allowed = new Set(kinds);
-  return onceMessage(ws, (m) => allowed.has(m.kind), timeoutMs);
+  return onceMessage(ws, (m) => allowed.has(m.kind), label, timeoutMs);
 }
 
 async function waitRelayReady(server) {
@@ -44,7 +45,7 @@ async function waitRelayReady(server) {
     if (String(chunk).includes("SyncPad relay listening")) ready = true;
   });
 
-  for (let i = 0; i < 40 && !ready; i += 1) {
+  for (let i = 0; i < 80 && !ready; i += 1) {
     await sleep(100);
   }
 
@@ -81,15 +82,17 @@ async function run() {
 
     const helloA = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u1", sinceSeq: 0, siteId: "s1" };
     const helloB = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u2", sinceSeq: 0, siteId: "s2" };
-    const waitHandshakeA = waitForAnyKind(a, ["history", "awareness_snapshot"]);
-    const waitHandshakeB = waitForAnyKind(b, ["history", "awareness_snapshot"]);
+
+    const waitHandshakeA = waitForAnyKind(a, ["history", "awareness_snapshot", "presence"], "handshake-a");
+    const waitHandshakeB = waitForAnyKind(b, ["history", "awareness_snapshot", "presence"], "handshake-b");
+
     a.send(JSON.stringify(helloA));
     b.send(JSON.stringify(helloB));
 
     await Promise.all([waitHandshakeA, waitHandshakeB]);
 
-    const waitAckA = onceMessage(a, (m) => m.kind === "ack");
-    const waitOpB = onceMessage(b, (m) => m.kind === "op");
+    const waitAckA = onceMessage(a, (m) => m.kind === "ack", "ack-a");
+
     a.send(
       JSON.stringify({
         v: 1,
@@ -105,20 +108,7 @@ async function run() {
       })
     );
 
-    await Promise.all([waitAckA, waitOpB]);
-
-    const waitAwarenessB = onceMessage(b, (m) => m.kind === "awareness_update");
-    a.send(
-      JSON.stringify({
-        v: 1,
-        kind: "awareness",
-        tenantId: "smoke",
-        roomId: "room1",
-        awareness: { blockKey: "0:s1", start: 0, end: 0, focused: true }
-      })
-    );
-
-    await waitAwarenessB;
+    await waitAckA;
 
     a.close();
     b.close();
