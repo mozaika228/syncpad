@@ -11,7 +11,9 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
   - Tombstone deletes and out-of-order delivery recovery via pending queues
 - **Network layer:**
   - Local-first apply for instant UX
-  - WebSocket relay server broadcasts operations and replays room history
+  - Offline-first outbox with durable local op-log (`localStorage`)
+  - Reconnect sync via incremental history replay (`sinceSeq`) + idempotent dedupe
+  - WebSocket relay assigns monotonic `seq`, sends `ack` and missing history
 - **Client UI:**
   - Collaborative block editor
   - Block type controls and inline formatting controls
@@ -51,15 +53,18 @@ node shared/test/rich-crdt.convergence.test.js
 
 ## Protocol (MVP)
 
-- client -> server: `{ kind: "op", room, op }`
+- client -> server:
+  - `{ kind: "hello", room, sinceSeq, siteId }`
+  - `{ kind: "op", room, op }`
 - server -> client:
-  - `{ kind: "history", roomId, ops }`
-  - `{ kind: "op", roomId, op }`
+  - `{ kind: "history", roomId, fromSeq, toSeq, events: [{ seq, op }] }`
+  - `{ kind: "op", roomId, seq, op }`
+  - `{ kind: "ack", roomId, seq, opId }`
   - `{ kind: "presence", roomId, users }`
 
 ## Current limits
 
-- Relay history is in-memory only (no durable persistence)
+- Relay history is in-memory only (no server-side durable persistence yet)
 - No tombstone garbage collection / compaction yet
 - Undo restore for deleted blocks currently recreates block shell (type) without restoring full deleted block text payload
 - Block split/merge UX is intentionally minimal in this iteration

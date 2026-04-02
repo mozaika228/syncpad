@@ -10,6 +10,7 @@ import {
 
 const ROOM = "default";
 const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:8080") + `/?room=${ROOM}`;
+const STORAGE_NS = "syncpad:v3";
 
 function escapeHtml(value) {
   return value
@@ -34,6 +35,57 @@ function cloneAttrs(attrs = {}) {
     italic: !!attrs.italic,
     underline: !!attrs.underline
   };
+}
+
+function readJson(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // best-effort persistence
+  }
+}
+
+function readNumber(key, fallback = 0) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return fallback;
+    return parsed;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeNumber(key, value) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // best-effort persistence
+  }
+}
+
+function getStableSiteId(room) {
+  const key = `${STORAGE_NS}:site:${room}`;
+  try {
+    const existing = window.localStorage.getItem(key);
+    if (existing) return existing;
+    const next = createSiteId();
+    window.localStorage.setItem(key, next);
+    return next;
+  } catch {
+    return createSiteId();
+  }
 }
 
 function renderSegments(segments, keyPrefix) {
@@ -61,13 +113,28 @@ export default function App() {
   const [activeBlockKey, setActiveBlockKey] = useState("");
   const [selection, setSelection] = useState({ start: 0, end: 0 });
 
-  const siteId = useMemo(() => createSiteId(), []);
+  const siteId = useMemo(() => getStableSiteId(ROOM), []);
+  const storage = useMemo(
+    () => ({
+      log: `${STORAGE_NS}:log:${ROOM}:${siteId}`,
+      outbox: `${STORAGE_NS}:outbox:${ROOM}:${siteId}`,
+      seq: `${STORAGE_NS}:seq:${ROOM}:${siteId}`
+    }),
+    [siteId]
+  );
+
   const docRef = useRef(new RichTextDocument());
   const socketRef = useRef(null);
   const lamportRef = useRef(0);
+  const lastSeqRef = useRef(0);
+
   const blockCacheRef = useRef(new Map());
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
+
+  const logRef = useRef([]);
+  const outboxRef = useRef([]);
+  const initializedRef = useRef(false);
 
   const blocks = docRef.current.getBlocks();
 
@@ -80,16 +147,91 @@ export default function App() {
     lamportRef.current = Math.max(lamportRef.current, maxLamportFromOp(op));
   }
 
+  function persistLog() {
+    writeJson(storage.log, logRef.current);
+  }
+
+  function appendLog(op) {
+    logRef.current.push(op);
+    if (logRef.current.length > 60000) {
+      logRef.current = logRef.current.slice(logRef.current.length - 60000);
+    }
+    persistLog();
+  }
+
+  function persistOutbox() {
+    writeJson(storage.outbox, outboxRef.current);
+  }
+
+  function queueOutbox(op) {
+    outboxRef.current.push(op);
+    persistOutbox();
+  }
+
+  function opKeyFromOp(op) {
+    return idKey(op.opId);
+  }
+
+  function removeOutboxByOpId(opId) {
+    if (!opId) return;
+    const key = idKey(opId);
+    const next = outboxRef.current.filter((item) => opKeyFromOp(item) !== key);
+    if (next.length !== outboxRef.current.length) {
+      outboxRef.current = next;
+      persistOutbox();
+    }
+  }
+
   function emit(op) {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ kind: "op", room: ROOM, op }));
   }
 
-  function applyAndRender(op) {
+  function flushOutbox() {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    for (const op of outboxRef.current) {
+      socket.send(JSON.stringify({ kind: "op", room: ROOM, op }));
+    }
+  }
+
+  function sendHello() {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ kind: "hello", room: ROOM, sinceSeq: lastSeqRef.current, siteId }));
+  }
+
+  function applyAndRender(op, persist = true) {
     const changed = docRef.current.applyOperation(op);
     absorbLamport(op);
-    if (changed) setRev((v) => v + 1);
+    if (changed) {
+      if (persist) appendLog(op);
+      setRev((v) => v + 1);
+    }
+    return changed;
+  }
+
+  function applyServerEntry(seq, op) {
+    if (typeof seq === "number") {
+      if (seq <= lastSeqRef.current) {
+        removeOutboxByOpId(op?.opId);
+        return;
+      }
+      if (seq > lastSeqRef.current + 1) {
+        sendHello();
+        return;
+      }
+    }
+
+    applyAndRender(op, true);
+
+    if (typeof seq === "number") {
+      lastSeqRef.current = seq;
+      writeNumber(storage.seq, seq);
+    }
+
+    removeOutboxByOpId(op?.opId);
   }
 
   function makeOpFromDescriptor(desc) {
@@ -192,7 +334,9 @@ export default function App() {
     for (const op of ops) {
       const inverses = buildInverseDescriptors(op);
       for (const inv of inverses) inverseBatch.unshift(inv);
-      applyAndRender(op);
+
+      queueOutbox(op);
+      applyAndRender(op, true);
       emit(op);
     }
 
@@ -200,6 +344,8 @@ export default function App() {
       undoStackRef.current.push(inverseBatch);
       if (clearRedo) redoStackRef.current = [];
     }
+
+    flushOutbox();
   }
 
   function executeDescriptorBatch(batch, pushUndo, clearRedo) {
@@ -219,13 +365,17 @@ export default function App() {
 
       const inverses = buildInverseDescriptors(op);
       for (const inv of inverses) redoBatch.unshift(inv);
-      applyAndRender(op);
+
+      queueOutbox(op);
+      applyAndRender(op, true);
       emit(op);
     }
 
     if (redoBatch.length > 0) {
       redoStackRef.current.push(redoBatch);
     }
+
+    flushOutbox();
   }
 
   function runRedo() {
@@ -315,34 +465,102 @@ export default function App() {
   }
 
   useEffect(() => {
-    const socket = new WebSocket(WS_URL);
-    socketRef.current = socket;
+    if (initializedRef.current) return;
 
-    socket.addEventListener("open", () => setStatus("online"));
-    socket.addEventListener("close", () => setStatus("offline"));
-    socket.addEventListener("error", () => setStatus("offline"));
+    const loadedLog = readJson(storage.log, []);
+    const loadedOutbox = readJson(storage.outbox, []);
+    const loadedSeq = readNumber(storage.seq, 0);
 
-    socket.addEventListener("message", (event) => {
-      let payload;
-      try {
-        payload = JSON.parse(event.data);
-      } catch {
-        return;
-      }
+    logRef.current = Array.isArray(loadedLog) ? loadedLog : [];
+    outboxRef.current = Array.isArray(loadedOutbox) ? loadedOutbox : [];
+    lastSeqRef.current = loadedSeq;
 
-      if (payload.kind === "history" && Array.isArray(payload.ops)) {
-        for (const op of payload.ops) applyAndRender(op);
-      }
-      if (payload.kind === "op" && payload.op) {
-        applyAndRender(payload.op);
-      }
-      if (payload.kind === "presence") {
-        setPeers(payload.users || 1);
-      }
-    });
+    let maxLamport = 0;
+    for (const op of logRef.current) {
+      docRef.current.applyOperation(op);
+      maxLamport = Math.max(maxLamport, maxLamportFromOp(op));
+    }
+    for (const op of outboxRef.current) {
+      maxLamport = Math.max(maxLamport, maxLamportFromOp(op));
+    }
 
-    return () => socket.close();
-  }, []);
+    lamportRef.current = maxLamport;
+    initializedRef.current = true;
+    setRev((v) => v + 1);
+  }, [storage]);
+
+  useEffect(() => {
+    let stopped = false;
+    let reconnectTimer = null;
+
+    function connect() {
+      if (stopped) return;
+      setStatus("connecting");
+
+      const socket = new WebSocket(WS_URL);
+      socketRef.current = socket;
+
+      socket.addEventListener("open", () => {
+        setStatus("online");
+        sendHello();
+        flushOutbox();
+      });
+
+      socket.addEventListener("close", () => {
+        setStatus("offline");
+        if (!stopped) {
+          reconnectTimer = window.setTimeout(connect, 1500);
+        }
+      });
+
+      socket.addEventListener("error", () => {
+        setStatus("offline");
+      });
+
+      socket.addEventListener("message", (event) => {
+        let payload;
+        try {
+          payload = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (payload.kind === "history" && Array.isArray(payload.events)) {
+          const events = payload.events.slice().sort((a, b) => a.seq - b.seq);
+          for (const entry of events) {
+            applyServerEntry(entry.seq, entry.op);
+          }
+          return;
+        }
+
+        if (payload.kind === "op" && payload.op) {
+          applyServerEntry(payload.seq, payload.op);
+          return;
+        }
+
+        if (payload.kind === "ack") {
+          if (typeof payload.seq === "number" && payload.seq > lastSeqRef.current) {
+            lastSeqRef.current = payload.seq;
+            writeNumber(storage.seq, payload.seq);
+          }
+          removeOutboxByOpId(payload.opId);
+          return;
+        }
+
+        if (payload.kind === "presence") {
+          setPeers(payload.users || 1);
+        }
+      });
+    }
+
+    connect();
+
+    return () => {
+      stopped = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      socketRef.current?.close();
+    };
+  }, [siteId, storage]);
 
   useEffect(() => {
     function onKeyDown(event) {
