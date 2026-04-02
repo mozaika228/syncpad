@@ -33,6 +33,11 @@ function onceMessage(ws, predicate, timeoutMs = 5000) {
   });
 }
 
+function waitForAnyKind(ws, kinds, timeoutMs = 5000) {
+  const allowed = new Set(kinds);
+  return onceMessage(ws, (m) => allowed.has(m.kind), timeoutMs);
+}
+
 async function waitRelayReady(server) {
   let ready = false;
   server.stdout.on("data", (chunk) => {
@@ -76,12 +81,12 @@ async function run() {
 
     const helloA = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u1", sinceSeq: 0, siteId: "s1" };
     const helloB = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u2", sinceSeq: 0, siteId: "s2" };
-    const waitHistoryA = onceMessage(a, (m) => m.kind === "history");
-    const waitHistoryB = onceMessage(b, (m) => m.kind === "history");
+    const waitHandshakeA = waitForAnyKind(a, ["history", "awareness_snapshot"]);
+    const waitHandshakeB = waitForAnyKind(b, ["history", "awareness_snapshot"]);
     a.send(JSON.stringify(helloA));
     b.send(JSON.stringify(helloB));
 
-    await Promise.all([waitHistoryA, waitHistoryB]);
+    await Promise.all([waitHandshakeA, waitHandshakeB]);
 
     const waitAckA = onceMessage(a, (m) => m.kind === "ack");
     const waitOpB = onceMessage(b, (m) => m.kind === "op");
