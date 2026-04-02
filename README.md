@@ -15,6 +15,7 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
   - Reconnect sync via incremental history replay (`sinceSeq`) + idempotent dedupe
   - WebSocket relay assigns monotonic `seq`, sends `ack` and missing history
   - Local tombstone GC + log compaction into compact snapshot when safe (outbox empty)
+  - Scalable relay hardening: bounded history + `baseSeq`, room TTL eviction, heartbeat ping/pong, backpressure-aware send
 - **Client UI:**
   - Collaborative block editor
   - Block type controls and inline formatting controls
@@ -38,6 +39,8 @@ Services:
 
 - client: `http://localhost:5173`
 - ws relay: `ws://localhost:8080`
+- health: `http://localhost:8080/healthz`
+- metrics: `http://localhost:8080/metrics`
 
 ## Formalization and convergence validation
 
@@ -71,3 +74,4 @@ node shared/test/rich-crdt.snapshot.test.js
 - Server-side snapshot compaction is not implemented yet (current GC/compaction is client-local)
 - Undo restore for deleted blocks currently recreates block shell (type) without restoring full deleted block text payload
 - Block split/merge UX is intentionally minimal in this iteration
+- Multi-node broadcast bus (Redis/NATS/Kafka) is not wired yet; current scalability improvements are single-node relay hardening
