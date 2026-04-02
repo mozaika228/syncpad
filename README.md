@@ -16,6 +16,7 @@ SyncPad is a standalone real-time collaborative editor with custom CRDTs (no Yjs
   - WebSocket relay assigns monotonic `seq`, sends `ack` and missing history
   - Local tombstone GC + log compaction into compact snapshot when safe (outbox empty)
   - Scalable relay hardening: bounded history + `baseSeq`, room TTL eviction, heartbeat ping/pong, backpressure-aware send
+  - Multi-tenant/security hardening: tenant isolation, hello-before-op policy, payload schema validation, per-socket rate limiting, optional token auth, origin allowlist
 - **Client UI:**
   - Collaborative block editor
   - Block type controls and inline formatting controls
@@ -42,6 +43,10 @@ Services:
 - health: `http://localhost:8080/healthz`
 - metrics: `http://localhost:8080/metrics`
 
+Client can pass tenant/session context via query params:
+
+- `http://localhost:5173/?tenant=acme&room=roadmap&user=alice&token=tokenA`
+
 ## Formalization and convergence validation
 
 - Sequence CRDT spec: `docs/CRDT_SPEC.md`
@@ -60,13 +65,23 @@ node shared/test/rich-crdt.snapshot.test.js
 ## Protocol (MVP)
 
 - client -> server:
-  - `{ kind: "hello", room, sinceSeq, siteId }`
-  - `{ kind: "op", room, op }`
+  - `{ kind: "hello", tenantId, roomId, userId, authToken, sinceSeq, siteId }`
+  - `{ kind: "op", tenantId, roomId, op }`
 - server -> client:
-  - `{ kind: "history", roomId, fromSeq, toSeq, events: [{ seq, op }] }`
-  - `{ kind: "op", roomId, seq, op }`
-  - `{ kind: "ack", roomId, seq, opId }`
-  - `{ kind: "presence", roomId, users }`
+  - `{ kind: "history", tenantId, roomId, fromSeq, toSeq, baseSeq, truncated, events: [{ seq, op }] }`
+  - `{ kind: "op", tenantId, roomId, seq, op }`
+  - `{ kind: "ack", tenantId, roomId, seq, opId }`
+  - `{ kind: "presence", tenantId, roomId, users }`
+  - `{ kind: "error", code, reason }`
+
+## Security / Multi-tenant env
+
+- `RELAY_AUTH_TOKEN=<token>`: one shared token for all tenants.
+- `TENANT_TOKENS_JSON={\"tenantA\":\"tokenA\",\"tenantB\":\"tokenB\"}`: per-tenant tokens (takes precedence over global token).
+- `ALLOWED_ORIGINS=http://localhost:5173,https://yourapp.example`: WebSocket Origin allowlist.
+- `MAX_OPS_PER_SECOND_PER_SOCKET=400`: per-socket op rate limiter.
+- `MAX_BYTES_PER_SECOND_PER_SOCKET=524288`: per-socket byte rate limiter.
+- `MAX_ROOMS_PER_TENANT=500`, `MAX_CLIENTS_PER_TENANT=2000`: tenant quotas.
 
 ## Current limits
 

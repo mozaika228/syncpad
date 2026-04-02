@@ -12,11 +12,35 @@ const heartbeatIntervalMs = Number(process.env.HEARTBEAT_INTERVAL_MS || 30000);
 const roomIdleTtlMs = Number(process.env.ROOM_IDLE_TTL_MS || 10 * 60 * 1000);
 const roomGcIntervalMs = Number(process.env.ROOM_GC_INTERVAL_MS || 60 * 1000);
 
+const maxRoomsPerTenant = Number(process.env.MAX_ROOMS_PER_TENANT || 500);
+const maxClientsPerTenant = Number(process.env.MAX_CLIENTS_PER_TENANT || 2000);
+const maxOpsPerSecondPerSocket = Number(process.env.MAX_OPS_PER_SECOND_PER_SOCKET || 400);
+const maxBytesPerSecondPerSocket = Number(process.env.MAX_BYTES_PER_SECOND_PER_SOCKET || 512 * 1024);
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+const globalAuthToken = process.env.RELAY_AUTH_TOKEN || "";
+const tenantTokens = (() => {
+  try {
+    return JSON.parse(process.env.TENANT_TOKENS_JSON || "{}");
+  } catch {
+    return {};
+  }
+})();
+
 const rooms = new Map();
+const tenantStats = new Map();
 
 const metrics = {
   connectionsAccepted: 0,
   connectionsRejected: 0,
+  authRejected: 0,
+  originRejected: 0,
+  rateLimited: 0,
+  schemaRejected: 0,
   messagesReceived: 0,
   messagesBroadcast: 0,
   messagesDroppedBackpressure: 0,
@@ -34,15 +58,67 @@ function now() {
   return Date.now();
 }
 
-function getOrCreateRoom(roomId) {
-  const existing = rooms.get(roomId);
+function sanitizeTenant(input) {
+  const value = String(input || "public").trim();
+  return /^[a-zA-Z0-9._-]{1,64}$/.test(value) ? value : null;
+}
+
+function sanitizeRoom(input) {
+  const value = String(input || "default").trim();
+  return /^[a-zA-Z0-9._-]{1,128}$/.test(value) ? value : null;
+}
+
+function normalizeTenantRoom(tenantId, roomId) {
+  const tenant = sanitizeTenant(tenantId);
+  const room = sanitizeRoom(roomId);
+  if (!tenant || !room) return null;
+  return { tenant, room, key: `${tenant}::${room}` };
+}
+
+function getTenantCounter(tenant) {
+  if (!tenantStats.has(tenant)) {
+    tenantStats.set(tenant, { rooms: 0, clients: 0 });
+  }
+  return tenantStats.get(tenant);
+}
+
+function incTenantRoom(tenant) {
+  getTenantCounter(tenant).rooms += 1;
+}
+
+function decTenantRoom(tenant) {
+  const counter = getTenantCounter(tenant);
+  counter.rooms = Math.max(0, counter.rooms - 1);
+}
+
+function incTenantClient(tenant) {
+  getTenantCounter(tenant).clients += 1;
+}
+
+function decTenantClient(tenant) {
+  const counter = getTenantCounter(tenant);
+  counter.clients = Math.max(0, counter.clients - 1);
+}
+
+function getOrCreateRoom(tenantId, roomId) {
+  const normalized = normalizeTenantRoom(tenantId, roomId);
+  if (!normalized) return null;
+
+  const existing = rooms.get(normalized.key);
   if (existing) {
     existing.lastActiveAt = now();
     return existing;
   }
 
+  const tenantCounter = getTenantCounter(normalized.tenant);
+  if (tenantCounter.rooms >= maxRoomsPerTenant) {
+    return null;
+  }
+
   const room = {
-    id: roomId,
+    key: normalized.key,
+    tenantId: normalized.tenant,
+    roomId: normalized.room,
     clients: new Set(),
     history: [],
     nextSeq: 1,
@@ -51,7 +127,8 @@ function getOrCreateRoom(roomId) {
     createdAt: now(),
     lastActiveAt: now()
   };
-  rooms.set(roomId, room);
+  rooms.set(normalized.key, room);
+  incTenantRoom(normalized.tenant);
   return room;
 }
 
@@ -61,6 +138,70 @@ function roomStats() {
     clientCount += room.clients.size;
   }
   return { roomCount: rooms.size, clientCount };
+}
+
+function validateId(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    Number.isInteger(value.lamport) &&
+    value.lamport >= 0 &&
+    typeof value.site === "string" &&
+    value.site.length > 0 &&
+    value.site.length <= 128
+  );
+}
+
+function validateAttrs(value) {
+  if (!value || typeof value !== "object") return false;
+  for (const [k, v] of Object.entries(value)) {
+    if (!["bold", "italic", "underline"].includes(k)) return false;
+    if (typeof v !== "boolean") return false;
+  }
+  return true;
+}
+
+function validateOp(op) {
+  if (!op || typeof op !== "object") return false;
+  if (!validateId(op.opId)) return false;
+
+  if (op.type === "block_insert") {
+    return validateId(op.after) && typeof op.blockType === "string";
+  }
+  if (op.type === "block_delete") {
+    return validateId(op.target);
+  }
+  if (op.type === "block_format") {
+    return validateId(op.target) && typeof op.blockType === "string";
+  }
+  if (op.type === "text_insert") {
+    return (
+      validateId(op.block) &&
+      validateId(op.after) &&
+      typeof op.value === "string" &&
+      op.value.length <= 4 &&
+      validateAttrs(op.attrs || {})
+    );
+  }
+  if (op.type === "text_delete") {
+    return validateId(op.block) && validateId(op.target);
+  }
+  if (op.type === "text_format") {
+    return validateId(op.block) && validateId(op.target) && validateAttrs(op.attrs || {});
+  }
+  return false;
+}
+
+function authAllowed(tenantId, token) {
+  if (tenantTokens && typeof tenantTokens === "object" && tenantTokens[tenantId]) {
+    return token === String(tenantTokens[tenantId]);
+  }
+
+  if (globalAuthToken) {
+    return token === globalAuthToken;
+  }
+
+  return true;
 }
 
 function safeSend(socket, payload) {
@@ -78,6 +219,38 @@ function safeSend(socket, payload) {
   }
 }
 
+function rejectSocket(socket, code, reason) {
+  try {
+    safeSend(socket, { kind: "error", code, reason });
+  } finally {
+    socket.close(1008, reason);
+  }
+}
+
+function rateAllowed(socket, bytes) {
+  const ts = now();
+  const elapsed = (ts - socket.rate.lastRefillAt) / 1000;
+
+  socket.rate.opsTokens = Math.min(
+    maxOpsPerSecondPerSocket,
+    socket.rate.opsTokens + elapsed * maxOpsPerSecondPerSocket
+  );
+  socket.rate.bytesTokens = Math.min(
+    maxBytesPerSecondPerSocket,
+    socket.rate.bytesTokens + elapsed * maxBytesPerSecondPerSocket
+  );
+  socket.rate.lastRefillAt = ts;
+
+  if (socket.rate.opsTokens < 1 || socket.rate.bytesTokens < bytes) {
+    metrics.rateLimited += 1;
+    return false;
+  }
+
+  socket.rate.opsTokens -= 1;
+  socket.rate.bytesTokens -= bytes;
+  return true;
+}
+
 function broadcast(room, payload) {
   for (const socket of room.clients) {
     const sent = safeSend(socket, payload);
@@ -86,7 +259,12 @@ function broadcast(room, payload) {
 }
 
 function sendPresence(room) {
-  broadcast(room, { kind: "presence", roomId: room.id, users: room.clients.size });
+  broadcast(room, {
+    kind: "presence",
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    users: room.clients.size
+  });
 }
 
 function historySliceFromSeq(room, sinceSeq) {
@@ -115,8 +293,47 @@ function trimHistory(room) {
   }
 }
 
+function validateHelloPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.kind !== "hello") return false;
+  if (payload.sinceSeq != null && !Number.isFinite(Number(payload.sinceSeq))) return false;
+  if (payload.tenantId != null && sanitizeTenant(payload.tenantId) === null) return false;
+  if (payload.roomId != null && sanitizeRoom(payload.roomId) === null) return false;
+  if (payload.userId != null && String(payload.userId).length > 128) return false;
+  if (payload.authToken != null && String(payload.authToken).length > 512) return false;
+  return true;
+}
+
 function handleHello(socket, room, payload) {
   metrics.historyRequests += 1;
+
+  if (!validateHelloPayload(payload)) {
+    metrics.schemaRejected += 1;
+    rejectSocket(socket, "bad_hello", "hello payload validation failed");
+    return;
+  }
+
+  const helloTenant = payload.tenantId || room.tenantId;
+  const helloRoom = payload.roomId || room.roomId;
+  if (helloTenant !== room.tenantId || helloRoom !== room.roomId) {
+    rejectSocket(socket, "tenant_room_mismatch", "tenant/room mismatch");
+    return;
+  }
+
+  const token = String(payload.authToken || socket.bootstrap.authToken || "");
+  if (!authAllowed(room.tenantId, token)) {
+    metrics.authRejected += 1;
+    rejectSocket(socket, "auth_failed", "invalid token");
+    return;
+  }
+
+  socket.session = {
+    ready: true,
+    userId: String(payload.userId || socket.bootstrap.userId || "anon"),
+    tenantId: room.tenantId,
+    roomId: room.roomId,
+    authTokenPresent: !!token
+  };
 
   const sinceRaw = Number(payload?.sinceSeq ?? 0);
   const sinceSeq = Number.isFinite(sinceRaw) ? Math.max(0, Math.floor(sinceRaw)) : 0;
@@ -124,7 +341,8 @@ function handleHello(socket, room, payload) {
   const { events, truncated } = historySliceFromSeq(room, sinceSeq);
   safeSend(socket, {
     kind: "history",
-    roomId: room.id,
+    tenantId: room.tenantId,
+    roomId: room.roomId,
     fromSeq: sinceSeq,
     toSeq: room.nextSeq - 1,
     baseSeq: room.baseSeq,
@@ -133,8 +351,23 @@ function handleHello(socket, room, payload) {
   });
 }
 
+function validateOpPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.kind !== "op") return false;
+  return validateOp(payload.op);
+}
+
 function handleOp(socket, room, payload) {
-  if (!payload?.op?.opId) return;
+  if (!socket.session?.ready) {
+    rejectSocket(socket, "hello_required", "hello handshake required before ops");
+    return;
+  }
+
+  if (!validateOpPayload(payload)) {
+    metrics.schemaRejected += 1;
+    rejectSocket(socket, "bad_op", "op payload validation failed");
+    return;
+  }
 
   const op = payload.op;
   const opKey = idKey(op.opId);
@@ -142,7 +375,14 @@ function handleOp(socket, room, payload) {
   if (room.seenOps.has(opKey)) {
     metrics.duplicateOps += 1;
     const seq = room.seenOps.get(opKey);
-    safeSend(socket, { kind: "ack", roomId: room.id, seq, opId: op.opId, duplicate: true });
+    safeSend(socket, {
+      kind: "ack",
+      tenantId: room.tenantId,
+      roomId: room.roomId,
+      seq,
+      opId: op.opId,
+      duplicate: true
+    });
     return;
   }
 
@@ -155,13 +395,22 @@ function handleOp(socket, room, payload) {
   room.seenOps.set(opKey, seq);
   trimHistory(room);
 
-  broadcast(room, { kind: "op", roomId: room.id, seq, op });
-  safeSend(socket, { kind: "ack", roomId: room.id, seq, opId: op.opId });
+  broadcast(room, { kind: "op", tenantId: room.tenantId, roomId: room.roomId, seq, op });
+  safeSend(socket, { kind: "ack", tenantId: room.tenantId, roomId: room.roomId, seq, opId: op.opId });
 }
 
-function setupSocket(room, socket) {
+function setupSocket(room, socket, bootstrap) {
   room.clients.add(socket);
   room.lastActiveAt = now();
+  incTenantClient(room.tenantId);
+
+  socket.bootstrap = bootstrap;
+  socket.session = { ready: false };
+  socket.rate = {
+    opsTokens: maxOpsPerSecondPerSocket,
+    bytesTokens: maxBytesPerSecondPerSocket,
+    lastRefillAt: now()
+  };
 
   socket.isAlive = true;
   socket.on("pong", () => {
@@ -173,14 +422,28 @@ function setupSocket(room, socket) {
   socket.on("message", (buffer, isBinary) => {
     metrics.messagesReceived += 1;
 
-    if (isBinary) return;
+    if (isBinary) {
+      rejectSocket(socket, "binary_not_allowed", "binary frames are not supported");
+      return;
+    }
+
     const raw = buffer.toString();
-    if (raw.length > maxMessageBytes) return;
+    if (raw.length > maxMessageBytes) {
+      rejectSocket(socket, "message_too_large", "message exceeds limit");
+      return;
+    }
+
+    if (!rateAllowed(socket, raw.length)) {
+      rejectSocket(socket, "rate_limited", "rate limit exceeded");
+      return;
+    }
 
     let payload;
     try {
       payload = JSON.parse(raw);
     } catch {
+      metrics.schemaRejected += 1;
+      rejectSocket(socket, "invalid_json", "json parse failed");
       return;
     }
 
@@ -191,11 +454,16 @@ function setupSocket(room, socket) {
 
     if (payload?.kind === "op") {
       handleOp(socket, room, payload);
+      return;
     }
+
+    metrics.schemaRejected += 1;
+    rejectSocket(socket, "unknown_kind", "unsupported message kind");
   });
 
   socket.on("close", () => {
     room.clients.delete(socket);
+    decTenantClient(room.tenantId);
     room.lastActiveAt = now();
     sendPresence(room);
   });
@@ -236,13 +504,20 @@ const server = http.createServer((req, res) => {
           wsPath,
           maxHistory,
           maxRoomClients,
+          maxRoomsPerTenant,
+          maxClientsPerTenant,
           maxMessageBytes,
           maxBufferedBytes,
+          maxOpsPerSecondPerSocket,
+          maxBytesPerSecondPerSocket,
           heartbeatIntervalMs,
           roomIdleTtlMs,
-          roomGcIntervalMs
+          roomGcIntervalMs,
+          allowedOrigins,
+          authEnabled: !!globalAuthToken || Object.keys(tenantTokens).length > 0
         },
         stats,
+        tenants: Object.fromEntries(tenantStats),
         counters: metrics
       })
     );
@@ -264,8 +539,40 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
+  const origin = String(request.headers.origin || "");
+  if (allowedOrigins.length > 0 && origin && !allowedOrigins.includes(origin)) {
+    metrics.originRejected += 1;
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\norigin_not_allowed");
+    socket.destroy();
+    return;
+  }
+
+  const tenantId = url.searchParams.get("tenant") || "public";
   const roomId = url.searchParams.get("room") || "default";
-  const room = getOrCreateRoom(roomId);
+  const normalized = normalizeTenantRoom(tenantId, roomId);
+
+  if (!normalized) {
+    metrics.connectionsRejected += 1;
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\ninvalid_tenant_or_room");
+    socket.destroy();
+    return;
+  }
+
+  const tenantCounter = getTenantCounter(normalized.tenant);
+  if (tenantCounter.clients >= maxClientsPerTenant) {
+    metrics.connectionsRejected += 1;
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\ntenant_client_limit");
+    socket.destroy();
+    return;
+  }
+
+  const room = getOrCreateRoom(normalized.tenant, normalized.room);
+  if (!room) {
+    metrics.connectionsRejected += 1;
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\nroom_limit");
+    socket.destroy();
+    return;
+  }
 
   if (room.clients.size >= maxRoomClients) {
     metrics.connectionsRejected += 1;
@@ -274,9 +581,16 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
+  const bootstrap = {
+    tenantId: normalized.tenant,
+    roomId: normalized.room,
+    userId: url.searchParams.get("user") || "anon",
+    authToken: url.searchParams.get("token") || ""
+  };
+
   wss.handleUpgrade(request, socket, head, (ws) => {
     metrics.connectionsAccepted += 1;
-    setupSocket(room, ws);
+    setupSocket(room, ws, bootstrap);
   });
 });
 
@@ -296,11 +610,12 @@ const heartbeatTimer = setInterval(() => {
 
 const gcTimer = setInterval(() => {
   const ts = now();
-  for (const [roomId, room] of rooms.entries()) {
+  for (const [roomKey, room] of rooms.entries()) {
     if (room.clients.size > 0) continue;
     if (ts - room.lastActiveAt < roomIdleTtlMs) continue;
 
-    rooms.delete(roomId);
+    rooms.delete(roomKey);
+    decTenantRoom(room.tenantId);
     metrics.roomsEvicted += 1;
   }
 }, roomGcIntervalMs);

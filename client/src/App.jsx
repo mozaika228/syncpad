@@ -11,8 +11,23 @@ import {
   restoreFromCompactedSnapshot
 } from "../../shared/src/rich-crdt";
 
-const ROOM = "default";
-const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:8080") + `/?room=${ROOM}`;
+function readRuntimeConfig() {
+  const params = new URLSearchParams(window.location.search);
+  const tenantId = params.get("tenant") || import.meta.env.VITE_TENANT_ID || "public";
+  const roomId = params.get("room") || import.meta.env.VITE_ROOM_ID || "default";
+  const userId = params.get("user") || import.meta.env.VITE_USER_ID || "anon";
+  const authToken = params.get("token") || import.meta.env.VITE_AUTH_TOKEN || "";
+  return { tenantId, roomId, userId, authToken };
+}
+
+const RUNTIME = readRuntimeConfig();
+const WS_URL =
+  (import.meta.env.VITE_WS_URL || "ws://localhost:8080") +
+  `/?tenant=${encodeURIComponent(RUNTIME.tenantId)}&room=${encodeURIComponent(
+    RUNTIME.roomId
+  )}&user=${encodeURIComponent(RUNTIME.userId)}${
+    RUNTIME.authToken ? `&token=${encodeURIComponent(RUNTIME.authToken)}` : ""
+  }`;
 const STORAGE_NS = "syncpad:v3";
 
 function escapeHtml(value) {
@@ -116,13 +131,13 @@ export default function App() {
   const [activeBlockKey, setActiveBlockKey] = useState("");
   const [selection, setSelection] = useState({ start: 0, end: 0 });
 
-  const siteId = useMemo(() => getStableSiteId(ROOM), []);
+  const siteId = useMemo(() => getStableSiteId(`${RUNTIME.tenantId}:${RUNTIME.roomId}`), []);
   const storage = useMemo(
     () => ({
-      log: `${STORAGE_NS}:log:${ROOM}:${siteId}`,
-      outbox: `${STORAGE_NS}:outbox:${ROOM}:${siteId}`,
-      seq: `${STORAGE_NS}:seq:${ROOM}:${siteId}`,
-      snapshot: `${STORAGE_NS}:snapshot:${ROOM}:${siteId}`
+      log: `${STORAGE_NS}:log:${RUNTIME.tenantId}:${RUNTIME.roomId}:${siteId}`,
+      outbox: `${STORAGE_NS}:outbox:${RUNTIME.tenantId}:${RUNTIME.roomId}:${siteId}`,
+      seq: `${STORAGE_NS}:seq:${RUNTIME.tenantId}:${RUNTIME.roomId}:${siteId}`,
+      snapshot: `${STORAGE_NS}:snapshot:${RUNTIME.tenantId}:${RUNTIME.roomId}:${siteId}`
     }),
     [siteId]
   );
@@ -195,7 +210,8 @@ export default function App() {
     }
 
     const snapshot = createCompactedSnapshot(docRef.current, {
-      room: ROOM,
+      tenantId: RUNTIME.tenantId,
+      room: RUNTIME.roomId,
       siteId,
       seq: lastSeqRef.current,
       lamport: lamportRef.current,
@@ -213,21 +229,35 @@ export default function App() {
   function emit(op) {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ kind: "op", room: ROOM, op }));
+    socket.send(
+      JSON.stringify({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op })
+    );
   }
 
   function flushOutbox() {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     for (const op of outboxRef.current) {
-      socket.send(JSON.stringify({ kind: "op", room: ROOM, op }));
+      socket.send(
+        JSON.stringify({ kind: "op", tenantId: RUNTIME.tenantId, roomId: RUNTIME.roomId, op })
+      );
     }
   }
 
   function sendHello() {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ kind: "hello", room: ROOM, sinceSeq: lastSeqRef.current, siteId }));
+    socket.send(
+      JSON.stringify({
+        kind: "hello",
+        tenantId: RUNTIME.tenantId,
+        roomId: RUNTIME.roomId,
+        userId: RUNTIME.userId,
+        authToken: RUNTIME.authToken,
+        sinceSeq: lastSeqRef.current,
+        siteId
+      })
+    );
   }
 
   function applyAndRender(op, persist = true) {
@@ -589,6 +619,11 @@ export default function App() {
 
         if (payload.kind === "presence") {
           setPeers(payload.users || 1);
+          return;
+        }
+
+        if (payload.kind === "error") {
+          setStatus("offline");
         }
       });
     }
@@ -649,7 +684,9 @@ export default function App() {
         <h1>SyncPad</h1>
         <div className="meta">
           <span className={`badge ${status}`}>{status}</span>
-          <span className="badge">room: {ROOM}</span>
+          <span className="badge">tenant: {RUNTIME.tenantId}</span>
+          <span className="badge">room: {RUNTIME.roomId}</span>
+          <span className="badge">user: {RUNTIME.userId}</span>
           <span className="badge">site: {siteId}</span>
           <span className="badge">peers: {peers}</span>
         </div>
