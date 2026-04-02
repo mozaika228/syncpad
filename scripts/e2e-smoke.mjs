@@ -6,14 +6,16 @@ const WS_URL = `ws://127.0.0.1:${PORT}/?tenant=smoke&room=room1&user=u`;
 
 function onceMessage(ws, predicate, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
+    const seenKinds = [];
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error("timeout waiting for message"));
+      reject(new Error(`timeout waiting for message (seen kinds: ${seenKinds.join(",")})`));
     }, timeoutMs);
 
     function onMessage(data) {
       try {
         const msg = JSON.parse(data.toString());
+        seenKinds.push(msg.kind || "unknown");
         if (!predicate(msg)) return;
         cleanup();
         resolve(msg);
@@ -74,11 +76,15 @@ async function run() {
 
     const helloA = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u1", sinceSeq: 0, siteId: "s1" };
     const helloB = { v: 1, kind: "hello", tenantId: "smoke", roomId: "room1", userId: "u2", sinceSeq: 0, siteId: "s2" };
+    const waitHistoryA = onceMessage(a, (m) => m.kind === "history");
+    const waitHistoryB = onceMessage(b, (m) => m.kind === "history");
     a.send(JSON.stringify(helloA));
     b.send(JSON.stringify(helloB));
 
-    await Promise.all([onceMessage(a, (m) => m.kind === "history"), onceMessage(b, (m) => m.kind === "history")]);
+    await Promise.all([waitHistoryA, waitHistoryB]);
 
+    const waitAckA = onceMessage(a, (m) => m.kind === "ack");
+    const waitOpB = onceMessage(b, (m) => m.kind === "op");
     a.send(
       JSON.stringify({
         v: 1,
@@ -94,8 +100,9 @@ async function run() {
       })
     );
 
-    await Promise.all([onceMessage(a, (m) => m.kind === "ack"), onceMessage(b, (m) => m.kind === "op")]);
+    await Promise.all([waitAckA, waitOpB]);
 
+    const waitAwarenessB = onceMessage(b, (m) => m.kind === "awareness_update");
     a.send(
       JSON.stringify({
         v: 1,
@@ -106,7 +113,7 @@ async function run() {
       })
     );
 
-    await onceMessage(b, (m) => m.kind === "awareness_update");
+    await waitAwarenessB;
 
     a.close();
     b.close();
